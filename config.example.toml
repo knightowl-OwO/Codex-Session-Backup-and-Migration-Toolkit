@@ -1,0 +1,20 @@
+# Paths may use ~ and are otherwise relative to the configuration file.
+# Give each machine its own config.toml. For Windows paths, use literal strings.
+[paths]
+formal_home = "~/.codex"
+test_home = "~/.codex_copy/.codex"
+backup_root = "~/.codex-backups"
+checkout = "session-backup-checkout"
+
+[repository]
+url = "git@github.com:ACCOUNT/PRIVATE-REPOSITORY.git"
+branch = "main"
+keep = 5
+# Use the same offset on all machines that share this backup branch.
+timestamp_utc_offset_minutes = 0
+
+[desktop]
+# Linux defaults to chatgpt on PATH. macOS searches for Codex.app.
+# Windows requires the actual executable for this installation.
+# command = ['C:\Path\To\Codex.exe']
+# process_names = ["Codex.exe", "codex-code-mode-host.exe"]
