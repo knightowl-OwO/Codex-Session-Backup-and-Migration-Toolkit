@@ -14,7 +14,9 @@ A command-line toolkit for backing up and migrating local Codex sessions. The so
 
 Install Python 3.11 or later and Git on both machines, and set up access to the private backup repository. The destination machine needs the Codex desktop app and an existing Codex data directory. On Windows and macOS, install `psutil` with the Python interpreter you use to run the toolkit, for example `python -m pip install psutil`. The toolkit uses it to inspect desktop processes when switching data directories.
 
-On each machine, use [config.example.toml](config.example.toml) as the starting point for `config.toml`. Paths can use `~`. Relative paths are resolved from the configuration file's directory.
+On each machine, create a `config.toml` in the project root and fill in the settings for that machine. For available settings and example values, see [config.example.toml](config.example.toml).
+
+Paths can use `~`. Relative paths are resolved from the configuration file's directory.
 
 On Windows, you can use a single-quoted TOML string to keep backslashes literal. For example, set `formal_home` under `[paths]` as shown below.
 
