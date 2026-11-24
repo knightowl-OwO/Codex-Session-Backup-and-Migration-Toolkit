@@ -9,12 +9,15 @@ checkout = "session-backup-checkout"
 [repository]
 url = "git@github.com:ACCOUNT/PRIVATE-REPOSITORY.git"
 branch = "main"
+# Keep this many snapshot directories on the branch tip.
 keep = 5
 # Use the same offset on all machines that share this backup branch.
 timestamp_utc_offset_minutes = 0
 
 [desktop]
-# Linux defaults to chatgpt on PATH. macOS searches for Codex.app.
-# Windows requires the actual executable for this installation.
+# Program run by test. The toolkit passes paths.test_home as CODEX_HOME automatically.
+# Linux defaults to chatgpt on PATH. macOS looks for Codex.app.
+# On Windows, set command to your installed executable.
 # command = ['C:\Path\To\Codex.exe']
+# Override process detection only if your installation uses different names.
 # process_names = ["Codex.exe", "codex-code-mode-host.exe"]

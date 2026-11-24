@@ -87,13 +87,9 @@ def _desktop_processes(names):
 class Desktop:
     def __init__(self, config):
         self.config = config
-        base = ("Codex", "codex-code-mode", "codex-code-mode-host")
-        if sys.platform.startswith("linux"):
-            defaults = (*base, "ChatGPT")
-        elif sys.platform == "win32":
-            defaults = tuple(f"{name}.exe" for name in (*base, "ChatGPT"))
-        else:
-            defaults = (*base, "ChatGPT")
+        names = ("codex", "codex-code-mode", "codex-code-mode-host", "chatgpt")
+        suffix = ".exe" if sys.platform == "win32" else ""
+        defaults = tuple(name + suffix for name in names)
         self.names = {name.casefold() for name in (config.process_names or defaults)}
 
     def processes(self):

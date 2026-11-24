@@ -16,7 +16,7 @@ from backup_codex_sessions import backup
 from codex_desktop import Desktop
 from codex_session_common import (
     DATABASES, DEFAULT_CONFIG, LOG_DIRECTORIES, PROJECT, SESSION_FILES, SNAPSHOT_NAME,
-    Repository, check_database, connect, directory_lock, load_config, rollout_relative,
+    Repository, check_database, connect, directory_lock, is_redirected, load_config, rollout_relative,
 )
 from prepare_codex_copy import stage_copy
 
@@ -118,7 +118,7 @@ def prepare(config, version):
     skill = PROJECT / ".agents/skills/codex-session-restore/SKILL.md"
     print(f"Prepared test copy: {config.test}")
     print(f"Ask Codex to repair this copy using {skill}")
-    print("Run test from your terminal after the repair.")
+    print("Run test from an external terminal after the repair to validate the copy and start Codex.")
 
 
 def validate_copy(home):
@@ -184,6 +184,28 @@ def report_formal_changes(config):
         print(f"The pre-promotion backup will retain {absent} formal-only sessions and {newer} newer formal versions.")
 
 
+def prune_promotion_backups(current):
+    try:
+        candidates = list(current.parent.iterdir())
+    except OSError as error:
+        print(f"WARNING: Promotion succeeded, but backup cleanup could not list {current.parent}: {error}",
+              file=sys.stderr)
+        return
+    for candidate in candidates:
+        if candidate == current or not re.fullmatch(r"codex-[0-9]{8}-[0-9]{6}", candidate.name):
+            continue
+        previous = candidate / "codex"
+        try:
+            if (is_redirected(candidate.lstat()) or not previous.is_dir()
+                    or is_redirected(previous.lstat()) or list(candidate.iterdir()) != [previous]):
+                continue
+            shutil.rmtree(candidate)
+            print(f"Removed old promotion backup: {candidate}")
+        except OSError as error:
+            print(f"WARNING: Promotion succeeded, but backup cleanup failed for {candidate}: {error}",
+                  file=sys.stderr)
+
+
 def promote(config):
     require_formal(config)
     if not (config.test / "config.toml").is_file():
@@ -214,6 +236,7 @@ def promote(config):
                     raise ValueError(f"Automatic rollback failed. Check the directories under {backup_dir}.") from error
                 print(f"Restored the formal directory. Check {backup_dir} for the failed copy.", file=sys.stderr)
             raise
+        prune_promotion_backups(backup_dir)
     print(f"Promoted {config.test} to {config.formal}")
     print(f"Previous formal data: {previous}")
 
@@ -239,6 +262,15 @@ def run(args, config):
             prepare(config, args.version)
         case "status":
             Desktop(config).status()
+        case "test":
+            with directory_lock(config.formal), directory_lock(config.test):
+                validate_copy(config.test)
+                if not args.check_only:
+                    desktop = Desktop(config)
+                    command = desktop.command()
+                    desktop.stop()
+                    validate_copy(config.test)
+                    desktop.launch_test(command)
         case "promote":
             promote(config)
         case "purge-backup":
@@ -246,14 +278,7 @@ def run(args, config):
         case action:
             with directory_lock(config.formal), directory_lock(config.test):
                 desktop = Desktop(config)
-                if action == "test":
-                    validate_copy(config.test)
-                    if not args.check_only:
-                        command = desktop.command()
-                        desktop.stop()
-                        validate_copy(config.test)
-                        desktop.launch_test(command)
-                elif action == "restore":
+                if action == "restore":
                     desktop.stop()
                     print(f"Test copy kept at {config.test}")
                     print(f"Reopen Codex for {config.formal}. Set CODEX_HOME explicitly when using a custom formal home.")
@@ -273,7 +298,7 @@ def main(argv=None):
     prepare_parser = commands.add_parser("prepare", parents=[config_option], help="Fetch a snapshot into the test copy.")
     prepare_parser.add_argument("version", nargs="?")
     prepare_parser.add_argument("--replace", action="store_true", help=argparse.SUPPRESS)
-    test = commands.add_parser("test", parents=[config_option], help="Check and open the test copy.")
+    test = commands.add_parser("test", parents=[config_option], help="Check the test copy and start Codex using it.")
     test.add_argument("--check-only", action="store_true", help="Validate the files without switching the desktop.")
     commands.add_parser("status", parents=[config_option], help="List desktop processes and known data directories.")
     commands.add_parser("restore", parents=[config_option], help="Exit testing and keep the copy.")

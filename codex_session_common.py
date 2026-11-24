@@ -35,8 +35,8 @@ class Config:
     branch: str
     keep: int
     utc_offset_minutes: int
-    desktop_command: tuple[str, ...]
-    process_names: tuple[str, ...]
+    desktop_command: tuple[str, ...] = ()
+    process_names: tuple[str, ...] = ()
 
     def timestamp(self):
         zone = timezone(timedelta(minutes=self.utc_offset_minutes))
