@@ -38,7 +38,7 @@ Keep session snapshots in the private repository because they contain chat messa
 
 ## Migration workflow
 
-Run the commands from the project directory in a terminal outside Codex. Use `python`, `python3`, or `py -3`, depending on which command runs Python 3.11 or later on your machine. On Linux, you can also use `bash ./codex-session-migrate.sh` in place of `python codex_session_migrate.py`.
+Run the commands from the project directory in a terminal outside Codex. The examples use `python`. Check its version with `python --version` and use an interpreter running Python 3.11 or later. Depending on your installation, that command may be `python3`, `python3.12`, or `py -3.12`.
 
 1. **Back up sessions on the source machine.**
 
