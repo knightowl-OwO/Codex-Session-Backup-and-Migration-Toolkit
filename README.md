@@ -16,23 +16,25 @@ Install Python 3.11 or later and Git on both machines. The destination machine n
 
 Create your own **private Git repository** on GitHub to store your session snapshots. Set up Git access to it on each machine using SSH or HTTPS credentials. In the toolkit's project root, create a `config.toml` on each machine with its own settings. For available settings and example values, see [config.example.toml](config.example.toml).
 
-Paths can use `~`. Relative paths are resolved from the configuration file's directory.
+Paths can use `~`. Use absolute paths or paths relative to the directory that contains `config.toml`.
 
-On Windows, you can use a single-quoted TOML string to keep backslashes literal. For example, set `formal_home` under `[paths]` as shown below.
+On Windows, use single-quoted TOML strings to keep backslashes literal. For example, set `formal_home` and `checkout` under `[paths]` as shown below.
 
 ~~~toml
-formal_home = 'C:\Users\your-name\.codex'
+[paths]
+formal_home = 'C:\Users\username\.codex'
+checkout = 'F:\individual-codex-session-backups'
 ~~~
 
 | Setting | What to configure                                                                                                                                                                                                                                              |
 | --- |----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `paths.formal_home` | Active Codex data directory, defaulting to `~/.codex`. The `backup` command reads from this directory.                                                                                                                                                         |
 | `paths.test_home` | Isolated test copy, set to `~/.codex_copy/.codex` in the template. Each successful `prepare` replaces this copy.                                                                                                                                               |
-| `paths.backup_root` | Location for the local rollback backup, set to `~/.codex-backups` in the template. Promotion requires the active, test, and backup directories to be on the same filesystem.                                                                                   |
-| `paths.checkout` | Local clone of the private backup repository. The toolkit creates it at this path if needed. After a successful backup, this directory contains one visible snapshot folder. |
+| `paths.backup_root` | Location for the local rollback backup, set to `~/.codex-backups` in the template. `promote` requires `formal_home`, `test_home`, and `backup_root` to be on the same filesystem. `checkout` can be on a different filesystem. |
+| `paths.checkout` | Local directory for the clone of your private backup repository. Keep it outside the toolkit directory to avoid nesting the private clone inside the public project. The toolkit creates the clone at this path if needed. After a successful backup, this directory contains one visible snapshot folder. |
 | `repository.url` and `repository.branch` | Clone URL of the remote private backup repository and the branch to use. Use the same URL and branch on the machines you migrate between.                                                                                                                      |
 | `repository.keep` | Maximum number of snapshot directories in the latest commit on the backup branch. The default is 5. Set any positive integer.                                                                                                                                  |
-| `repository.timestamp_utc_offset_minutes` | UTC offset for snapshot timestamps. Use the same offset on machines that push to the same branch.                                                                                                                                                              |
+| `repository.timestamp_utc_offset_minutes` | UTC offset in minutes for snapshot timestamps. Use `480` for Beijing time (UTC+8) or `0` for UTC. Use the same offset on every device that shares the backup branch. |
 
 When `backup` creates a new snapshot, it fetches the remote branch, then keeps the newest `keep` snapshot directories by their name timestamps. With `keep = 5`, adding a sixth snapshot removes the oldest directory in the new commit. If you lower `keep`, the next new snapshot removes as many older directories as needed. The remote branch reflects these deletions after a successful push. Older snapshots remain in Git history and can still be selected by name with `prepare`.
 
@@ -44,11 +46,13 @@ Keep session snapshots in the private repository because they contain chat messa
 
 `[desktop]` tells the toolkit how to start and identify the Codex desktop app. `desktop.command` specifies the **program to run**. The first item is the executable and any remaining items are its arguments. `paths.test_home` specifies the **data to open**. When you run `test`, the toolkit passes that path as `CODEX_HOME` only to the new Codex process and its children. Your terminal keeps its existing environment.
 
-On Linux, the default is `chatgpt` on `PATH`. On macOS, the toolkit looks for `Codex.app` in `/Applications` and `~/Applications`. On Windows, set `command` to the executable for your installation. For example, add this to your local `config.toml` and replace the example path with the installed executable.
+On Linux, the default is `chatgpt` on `PATH`. On macOS, the toolkit looks for `Codex.app` in `/Applications` and `~/Applications`.
+
+On Windows, set `command` to the path of the GUI launcher for your installation. For Microsoft Store or MSIX installations, this may be `ChatGPT.exe`. A `codex.exe` process path reported by PowerShell may belong to a backend process, so verify which executable opens the desktop app. Replace the example path below with the one on your machine. Windows app updates can change the versioned directory under `WindowsApps`, so check the path again after an update.
 
 ~~~toml
 [desktop]
-command = ['C:\Path\To\Codex.exe']
+command = ['C:\Program Files\WindowsApps\OpenAI.Codex_26.1120.5083.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe']
 ~~~
 
 Leave `process_names` at its defaults unless process detection misses your installation. If you set it, list the actual process names shown by your OS, including any Codex backend processes. The toolkit uses those names for `status`, to check whether the test copy is in use, and to check that Codex has exited before replacing data.
