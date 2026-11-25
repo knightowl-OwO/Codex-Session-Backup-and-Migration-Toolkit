@@ -15,39 +15,6 @@ from codex_session_common import (
 GITHUB_FILE_LIMIT = 100 * 1024**2
 
 
-def prepare_checkout(repo):
-    repo.fetch()
-    git = repo.git
-    branch = repo.config.branch
-    if repo.output("remote", "get-url", "--push", "origin") != repo.config.remote:
-        raise RuntimeError("The backup checkout has a different push URL.")
-    if repo.output("status", "--porcelain"):
-        raise RuntimeError(f"The backup checkout has local changes: {repo.path}")
-
-    remote_exists = repo.has_ref(repo.ref)
-    current = git("symbolic-ref", "--quiet", "HEAD", capture=True, check=False).stdout.strip()
-    new_branch = False
-    if current != f"refs/heads/{branch}":
-        if repo.has_ref(f"refs/heads/{branch}"):
-            git("switch", branch)
-        elif remote_exists:
-            git("switch", "-c", branch, "--track", repo.ref)
-        elif git("rev-parse", "--verify", "--quiet", "HEAD", check=False).returncode:
-            git("symbolic-ref", "HEAD", f"refs/heads/{branch}")
-        else:
-            git("switch", "-c", branch)
-            new_branch = True
-    if remote_exists:
-        git("merge", "--ff-only", repo.ref)
-    head = git("rev-parse", "--verify", "--quiet", "HEAD", capture=True, check=False)
-    # Re-running after a failed push should publish the existing snapshot first.
-    pending = not new_branch and head.returncode == 0 and (
-        not remote_exists
-        or head.stdout.strip() != repo.output("rev-parse", repo.ref)
-    )
-    return branch, pending
-
-
 def source_files(source):
     """Record the session files and index so changes during the copy can be detected."""
     def walk_error(error):
@@ -78,29 +45,38 @@ def source_files(source):
     return files
 
 
-def validate_rollouts(source, snapshot):
+def validate_and_relink_rollouts(source, snapshot):
     database = snapshot / DATABASES[0]
-    with connect(database) as db:
+    with connect(database, "rw") as db, db:
+        relinked = []
         rows = db.execute("SELECT id, rollout_path FROM threads WHERE rollout_path IS NOT NULL")
         for thread_id, rollout in rows:
             relative = rollout_relative(rollout, source)
-            if relative is None or not (snapshot / relative).is_file():
-                raise RuntimeError(f"Thread {thread_id} has no log in the snapshot.")
+            if relative is not None:
+                if (snapshot / relative).is_file():
+                    continue
+                if relative.suffix == ".jsonl":
+                    compressed = relative.with_suffix(".jsonl.zst")
+                    if (snapshot / compressed).is_file():
+                        relinked.append((str(source / compressed), thread_id))
+                        continue
+            raise RuntimeError(f"Thread {thread_id} has no matching rollout in the snapshot: {rollout}")
+        db.executemany("UPDATE threads SET rollout_path = ? WHERE id = ?", relinked)
+    if relinked:
+        print(f"Updated {len(relinked)} rollout references to compressed logs in the snapshot.")
 
 
 def copy_snapshot(source, snapshot):
     before = source_files(source)
     for database in DATABASES:
         backup_database(source / database, snapshot / database)
-    for directory in LOG_DIRECTORIES:
-        (snapshot / directory).mkdir(exist_ok=True)
     for relative in before:
         target = snapshot / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source / relative, target)
     if source_files(source) != before:
         return False
-    validate_rollouts(source, snapshot)
+    validate_and_relink_rollouts(source, snapshot)
     for path in snapshot.rglob("*"):
         if path.is_file() and path.stat().st_size > GITHUB_FILE_LIMIT:
             raise RuntimeError(f"GitHub's 100 MiB file limit would be exceeded by {path.relative_to(snapshot)}")
@@ -108,59 +84,58 @@ def copy_snapshot(source, snapshot):
 
 
 def commit_snapshot(repo, snapshot):
-    existing = sorted(
-        entry.name for entry in repo.path.iterdir()
-        if SNAPSHOT_NAME.fullmatch(entry.name) and entry.is_dir() and not entry.is_symlink()
-    )
+    parent = repo.output("rev-parse", repo.ref) if repo.has_ref(repo.ref) else None
+    existing = []
+    if parent:
+        existing = [
+            name for name in repo.output("ls-tree", "-d", "--name-only", parent).splitlines()
+            if SNAPSHOT_NAME.fullmatch(name)
+        ]
+    if snapshot.name in existing:
+        raise RuntimeError(f"Snapshot already exists: {snapshot.name}")
     expired = sorted([*existing, snapshot.name])[:-repo.config.keep]
     if snapshot.name in expired:
         raise ValueError("The snapshot timestamp precedes the retained backups. Check the clock and UTC offset.")
-    destination = repo.path / snapshot.name
-    if destination.exists():
-        raise RuntimeError(f"Snapshot already exists: {destination}")
-
-    # Keep the old directories available until the commit succeeds.
-    moved = []
-    paths = [snapshot.name, *expired]
-    snapshot.rename(destination)
-    try:
-        for name in expired:
-            (repo.path / name).rename(snapshot.parent / name)
-            moved.append(name)
-        repo.git("add", "-A", "-f", "--", *paths)
-        repo.git("commit", "-m", f"Back up Codex sessions {snapshot.name}")
-    except (OSError, CalledProcessError, KeyboardInterrupt):
-        for name in moved:
-            (snapshot.parent / name).rename(repo.path / name)
-        destination.rename(snapshot)
-        if repo.git("rev-parse", "--verify", "--quiet", "HEAD", check=False).returncode == 0:
-            repo.git("reset", "--quiet", "--", *paths)
-        else:
-            repo.git("rm", "--quiet", "-r", "-f", "--cached", "--ignore-unmatch", "--", *paths)
-        raise
+    # Prepare the new commit without changing the visible local snapshot.
+    work_tree = snapshot.parent
+    env = {**os.environ, "GIT_INDEX_FILE": str(work_tree / "index")}
+    options = {"env": env, "work_tree": work_tree}
+    repo.git("read-tree", parent or "--empty", **options)
+    repo.git("add", "-f", "--", snapshot.name, **options)
+    if expired:
+        repo.git("rm", "--quiet", "-r", "--cached", "--", *expired, **options)
+    tree = repo.git("write-tree", capture=True, **options).stdout.strip()
+    parents = ("-p", parent) if parent else ()
+    return repo.output("commit-tree", tree, *parents, "-m", f"Back up Codex sessions {snapshot.name}")
 
 
 def backup(config):
     repo = Repository(config)
     with directory_lock(config.formal), directory_lock(repo.path):
-        branch, pending = prepare_checkout(repo)
-        if pending:
-            print("Retrying the push of an existing local backup commit.", flush=True)
+        repo.fetch()
+        repo.require_clean_checkout()
+        if repo.output("remote", "get-url", "--push", "origin") != config.remote:
+            raise ValueError("The backup checkout has a different push URL.")
+        name = f"codex-git-{config.timestamp()}"
+        print(f"Taking a snapshot of {config.formal}", flush=True)
+        for attempt in range(3):
+            with TemporaryDirectory(prefix=".snapshot-", dir=repo.path.parent) as staging:
+                snapshot = Path(staging).resolve() / name
+                try:
+                    stable = copy_snapshot(config.formal, snapshot)
+                except FileNotFoundError:
+                    stable = False
+                if stable:
+                    commit = commit_snapshot(repo, snapshot)
+                    break
+            if attempt < 2:
+                print("Session files changed during the copy. Retrying.", flush=True)
         else:
-            name = f"codex-git-{config.timestamp()}"
-            print(f"Taking a snapshot of {config.formal}", flush=True)
-            for attempt in range(3):
-                with TemporaryDirectory(prefix=".codex-backup-", dir=repo.path.parent) as staging:
-                    snapshot = Path(staging) / name
-                    try:
-                        stable = copy_snapshot(config.formal, snapshot)
-                    except FileNotFoundError:
-                        stable = False
-                    if stable:
-                        commit_snapshot(repo, snapshot)
-                        break
-                if attempt < 2:
-                    print("Session files changed during the copy. Retrying.", flush=True)
-            else:
-                raise RuntimeError("Session files were missing or changing. Check the Codex home and retry.")
-        repo.git("push", "-u", "origin", f"HEAD:refs/heads/{branch}")
+            raise RuntimeError("Session files were missing or changing. Check the Codex home and retry.")
+        repo.git("push", "origin", f"{commit}:refs/heads/{config.branch}")
+        try:
+            repo.require_clean_checkout()
+            repo.show_snapshot(commit, name)
+        except (CalledProcessError, ValueError) as error:
+            raise RuntimeError(f"Uploaded {name}, but could not refresh its local copy at {repo.path}.") from error
+        print(f"Latest local snapshot: {repo.path / name}")

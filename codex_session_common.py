@@ -130,10 +130,13 @@ class Repository:
         self.path = config.checkout
         self.ref = f"refs/remotes/origin/{config.branch}"
 
-    def git(self, *args, check=True, capture=False, stdout=None):
+    def git(self, *args, check=True, capture=False, env=None, work_tree=None):
+        command = ["git", "-C", str(self.path), "-c", "core.autocrlf=false"]
+        if work_tree is not None:
+            command.extend(["-c", "core.sparseCheckout=false", f"--work-tree={work_tree}"])
         return subprocess.run(
-            ["git", "-C", str(self.path), "-c", "core.autocrlf=false", *args],
-            check=check, stdout=subprocess.PIPE if capture else stdout,
+            [*command, *args],
+            check=check, stdout=subprocess.PIPE if capture else None, env=env,
             text=capture, encoding="utf-8" if capture else None,
         )
 
@@ -144,16 +147,36 @@ class Repository:
         return self.git("show-ref", "--verify", "--quiet", ref, check=False).returncode == 0
 
     def fetch(self):
-        subprocess.run(["git", "check-ref-format", "--branch", self.config.branch],
-                       check=True, stdout=subprocess.DEVNULL)
+        branch = f"refs/heads/{self.config.branch}"
+        subprocess.run(["git", "check-ref-format", branch], check=True)
         if not self.path.exists():
-            subprocess.run(["git", "-c", "core.autocrlf=false", "clone", "--", self.config.remote, str(self.path)],
-                           check=True)
+            subprocess.run(
+                ["git", "-c", "core.autocrlf=false", "clone", "--sparse", "--", self.config.remote, str(self.path)],
+                check=True,
+            )
         if not (self.path / ".git").is_dir():
             raise ValueError(f"Expected a dedicated backup checkout: {self.path}")
         if self.output("remote", "get-url", "origin") != self.config.remote:
             raise ValueError("The backup checkout has a different origin.")
         self.git("fetch", "--no-tags", "--prune", "origin")
+
+    def require_clean_checkout(self):
+        if self.output("status", "--porcelain=v1", "--untracked-files=all") or self.output(
+            "status", "--porcelain=v1", "--ignored=matching", "--",
+            ":(top,glob)codex-git-*/**",
+        ):
+            raise ValueError(f"Review the local changes in the backup repository first: {self.path}")
+        local_ref = f"refs/heads/{self.config.branch}"
+        if self.has_ref(local_ref):
+            if not self.has_ref(self.ref) or self.git(
+                "merge-base", "--is-ancestor", local_ref, self.ref, check=False,
+            ).returncode != 0:
+                raise ValueError(f"The local backup branch has unpublished or divergent commits: {local_ref}")
+
+    def show_snapshot(self, commit, name):
+        self.git("sparse-checkout", "set", "--no-cone", "--", "/*", "!/codex-git-*/", f"/{name}/")
+        self.git("switch", "-C", self.config.branch, commit)
+        self.git("branch", "--set-upstream-to", self.ref, self.config.branch)
 
 
 def connect(path, mode="ro"):

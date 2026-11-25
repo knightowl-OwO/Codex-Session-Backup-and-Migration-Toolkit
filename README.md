@@ -29,14 +29,16 @@ formal_home = 'C:\Users\your-name\.codex'
 | `paths.formal_home` | Active Codex data directory, defaulting to `~/.codex`. The `backup` command reads from this directory.                                                                                                                                                         |
 | `paths.test_home` | Isolated test copy, set to `~/.codex_copy/.codex` in the template. Each successful `prepare` replaces this copy.                                                                                                                                               |
 | `paths.backup_root` | Location for the local rollback backup, set to `~/.codex-backups` in the template. Promotion requires the active, test, and backup directories to be on the same filesystem.                                                                                   |
-| `paths.checkout` | **Local clone of the repository at `repository.url`.** The default is `session-backup-checkout` in the project directory. The toolkit clones the repository there if the path does not exist. For an existing clone, its `origin` must match `repository.url`. |
+| `paths.checkout` | Local clone of the private backup repository. The toolkit creates it at this path if needed. After a successful backup, this directory contains one visible snapshot folder. |
 | `repository.url` and `repository.branch` | Clone URL of the remote private backup repository and the branch to use. Use the same URL and branch on the machines you migrate between.                                                                                                                      |
 | `repository.keep` | Maximum number of snapshot directories in the latest commit on the backup branch. The default is 5. Set any positive integer.                                                                                                                                  |
 | `repository.timestamp_utc_offset_minutes` | UTC offset for snapshot timestamps. Use the same offset on machines that push to the same branch.                                                                                                                                                              |
 
 When `backup` creates a new snapshot, it fetches the remote branch, then keeps the newest `keep` snapshot directories by their name timestamps. With `keep = 5`, adding a sixth snapshot removes the oldest directory in the new commit. If you lower `keep`, the next new snapshot removes as many older directories as needed. The remote branch reflects these deletions after a successful push. Older snapshots remain in Git history and can still be selected by name with `prepare`.
 
-Keep session snapshots in the private repository because they contain chat messages, tool output, and local paths. Before publishing the toolkit, check the staged files, especially if you changed the checkout directory. The ignore rules cover the local `config.toml` and the default checkout directory. [Ignore rules](.gitignore)
+After a successful push, `backup` replaces the visible snapshot in `paths.checkout` with the one it just uploaded. Open that `codex-git-*` folder directly in your file manager. A failed push leaves the previous local snapshot available. Older snapshots and Git history still take up space in the clone's `.git` directory. `backup` and `prepare` reuse the clone and fetch updates as needed.
+
+Keep session snapshots in the private repository because they contain chat messages, tool output, and local paths. Before publishing the toolkit, check the staged files. The ignore rules cover the local `config.toml` and the default clone directory. [Ignore rules](.gitignore)
 
 ### Desktop launch
 

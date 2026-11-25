@@ -4,6 +4,7 @@
 formal_home = "~/.codex"
 test_home = "~/.codex_copy/.codex"
 backup_root = "~/.codex-backups"
+# Local backup repository. Only the latest uploaded snapshot is checked out.
 checkout = "session-backup-checkout"
 
 [repository]
