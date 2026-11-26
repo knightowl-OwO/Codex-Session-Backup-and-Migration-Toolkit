@@ -372,6 +372,84 @@ class Snapshots(unittest.TestCase):
         maps.update(context)
         self.assertEqual(context["payload"], {"cwd": str(self.root / "view"), "workspace_roots": []})
 
+    def promotion_fixture(self):
+        copy = self.root / ".codex_copy"
+        copy.mkdir()
+        config = Config(self.source, copy / ".codex", self.root / "backups", self.root / "git",
+                        "unused", "main", 5, 0)
+        self.dest.rename(config.test)
+        (config.test / "config.toml").touch()
+        (config.test / cli.RECEIPT).write_text(json.dumps({"format": 1, "workspaces": {}}))
+        model = Snapshot(config.test)
+        maps = Workspaces(model, {WINDOWS: None}, config.history_view)
+        rewrite_logs(model, config.test, maps)
+        update_indexes(model, config.test)
+        relocate(model, config.test, config.test, maps)
+        return config
+
+    def test_promote_removes_dedicated_copy_and_keeps_stable_history_workspace(self):
+        config = self.promotion_fixture()
+        copy = config.test.parent
+        (copy / ".session-repair-abcdefgh" / "repaired").mkdir(parents=True)
+        (copy / ".history-check-12345678").mkdir()
+        (copy / ".codex-desktop.log").touch()
+        (copy / ".codex.codex-migration.lock").touch()
+        mapping = copy / "workspace-map-codex-git-20260101-000000.json"
+        mapping.write_text('{"old": null}')
+        with patch.object(cli, "suspend_windows_sandbox", contextlib.nullcontext):
+            cli.promote(config, SimpleNamespace(stop_for_promotion=lambda: None))
+        self.assertFalse(copy.exists())
+        self.assertTrue(config.history_view.is_dir())
+        self.assertEqual((copy.parent / mapping.name).read_text(), '{"old": null}')
+        current = Snapshot(config.formal)
+        self.assertEqual(current.threads[LIVE].cwd, str(config.history_view))
+        self.assertEqual(len(current.threads[LIVE].recorded_turns()), 3)
+        self.assertTrue(current.threads[ARCHIVE].archived)
+        self.assertEqual(len(list(config.backups.glob("*/codex"))), 1)
+
+    def test_legacy_workspaces_and_user_files_survive_cleanup(self):
+        config = self.promotion_fixture()
+        copy = config.test.parent
+        view = copy / ".codex-history-view"
+        view.mkdir()
+        visual = config.test / "visualizations" / "fixture"
+        visual.mkdir(parents=True)
+        (visual / "plot").write_bytes(b"plot")
+        (config.test / "packages").mkdir()
+        (config.test / "packages" / "large").touch()
+        unknown = copy / "notes.txt"
+        unknown.write_text("mine")
+        mapping = copy / "workspace-map-codex-git-20260101-000000.json"
+        mapping.write_text("new")
+        (copy.parent / mapping.name).write_text("existing")
+        # The rollback uses the old viewing directory. Only a structured log field refers to the plot.
+        with database(config.formal / cli.DATABASES[0]) as db:
+            db.execute("UPDATE threads SET cwd=?", (str(view),))
+        path = config.test / rollout(LIVE, LAST)
+        with path.open("ab") as f:
+            f.write(json.dumps({"type": "turn_context", "payload": {"workspace_roots": [str(visual)]}}).encode() + b"\n")
+        with patch.object(cli, "suspend_windows_sandbox", contextlib.nullcontext):
+            cli.promote(config, SimpleNamespace(stop_for_promotion=lambda: None))
+        self.assertTrue(view.is_dir())
+        self.assertEqual((visual / "plot").read_bytes(), b"plot")
+        self.assertFalse((config.test / "packages").exists())
+        self.assertEqual(unknown.read_text(), "mine")
+        self.assertEqual(mapping.read_text(), "new")
+        self.assertEqual((copy.parent / mapping.name).read_text(), "existing")
+        self.assertEqual(len(list(config.backups.glob("*/codex"))), 1)
+        remapped = Workspaces(SimpleNamespace(places={str(view): {(LIVE, "cwd")}}), {},
+                              config.history_view, legacy_view=view)
+        self.assertEqual(remapped.cwd(str(view)), str(config.history_view))
+
+    def test_failed_promotion_keeps_copy_and_repair_staging(self):
+        config = self.promotion_fixture()
+        stage = config.test.parent / ".session-repair-aaaaaaaa"
+        stage.mkdir()
+        with cli.directory_lock(config.test_lock), self.assertRaisesRegex(ValueError, "Could not lock"):
+            cli.promote(config)
+        self.assertTrue(stage.is_dir())
+        self.assertTrue((config.test / cli.RECEIPT).is_file())
+
     def test_missing_cycle_wrong_id_and_boundary(self):
         path = self.dest / rollout(LIVE, LAST)
         lines = list(records(path))
@@ -491,7 +569,7 @@ class RealClient(unittest.TestCase):
             git("add", "--", *(str(Path(name) / p) for p in (*cli.LOG_DIRECTORIES, *cli.SESSION_FILES)))
             git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture")
             config = root / "toolkit.toml"
-            config.write_text("[paths]\nformal_home='formal'\ntest_home='testing/home'\nbackup_root='rollback'\n"
+            config.write_text("[paths]\nformal_home='formal'\ntest_home='.codex_copy/.codex'\nbackup_root='rollback'\n"
                               "checkout='checkout'\n[repository]\nurl=" + json.dumps(str(remote)), encoding="utf-8")
             (root / "formal").mkdir()
             (root / "formal/config.toml").touch()
@@ -507,7 +585,7 @@ class RealClient(unittest.TestCase):
             self.assertTrue(json.loads(output.getvalue())["workspaces"])
             mapping = root / "map.json"
             repair = [*args, "repair", "--map", str(mapping), "--app-server", SERVER]
-            prepared = root / "testing/home"
+            prepared = root / ".codex_copy/.codex"
             receipt = (prepared / ".session-restore.json").read_bytes()
             mapping.write_text(json.dumps({WINDOWS: "unconfirmed/relative/path"}))
             with self.assertRaisesRegex(SystemExit, "existing absolute local directory"):
@@ -523,7 +601,7 @@ class RealClient(unittest.TestCase):
                 cli.main([*args, "test"])
                 stop.assert_called_once()
                 launch.assert_called_once_with(["gui"])
-            model = Snapshot(root / "testing/home")
+            model = Snapshot(prepared)
             result = read_probe(model, SERVER, root / "paged", size=1, resume=True)
             self.assertEqual([r[0] for r in result[LIVE][2]], model.threads[LIVE].recorded_turns())
             self.assertEqual(len(result[LIVE][2]), 3)
@@ -542,3 +620,17 @@ class RealClient(unittest.TestCase):
                     cli.main([*args, "test"])
                 stop.assert_not_called()
                 launch.assert_not_called()
+            # Repair from the pin again, promote, reopen the history after cleanup, then prepare afresh.
+            cli.main(repair)
+            formal = root / "formal"
+            for relative in cli.SESSION_FILES:
+                target = formal / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes((source / relative).read_bytes())
+            with patch.object(cli, "suspend_windows_sandbox", contextlib.nullcontext):
+                cli.promote(cli.load_config(config), SimpleNamespace(stop_for_promotion=lambda: None))
+            self.assertFalse(prepared.parent.exists())
+            after = read_probe(Snapshot(formal), SERVER, root / "promoted-reader", size=1, resume=True)
+            compare_history(result, after)
+            cli.main([*args, "prepare", name])
+            self.assertTrue((prepared / cli.RECEIPT).is_file())

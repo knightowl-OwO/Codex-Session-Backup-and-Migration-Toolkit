@@ -38,6 +38,22 @@ class Config:
     desktop_command: tuple[str, ...] = ()
     process_names: tuple[str, ...] = ()
 
+    @property
+    def dedicated_copy(self):
+        return self.test == self.test.parent.parent / ".codex_copy" / ".codex"
+
+    @property
+    def test_lock(self):
+        # Keep the lock outside a removable copy root, including between migrations.
+        return self.test.parent if self.dedicated_copy else self.test
+
+    @property
+    def history_view(self):
+        return self.formal.with_name(self.formal.name + "-history-view")
+
+    def scratch_prefix(self, operation):
+        return f".{operation}-" if self.dedicated_copy else f"{self.test.name}.{operation}-"
+
     def timestamp(self):
         zone = timezone(timedelta(minutes=self.utc_offset_minutes))
         return datetime.now(zone).strftime("%Y%m%d-%H%M%S")

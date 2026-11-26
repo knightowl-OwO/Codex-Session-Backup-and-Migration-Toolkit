@@ -21,7 +21,8 @@ from codex_session_common import (
     Repository, check_database, connect, directory_lock, is_redirected, load_config, rollout_relative,
 )
 from prepare_codex_copy import stage_copy
-from restore_snapshot import RECEIPT, pin, repair, verify
+from restore_rollouts import catalog_rows, records, workspace_fields
+from restore_snapshot import RECEIPT, pin, remove_scratch, repair, verify
 
 
 COMMAND_ERRORS = (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError, EOFError)
@@ -109,13 +110,14 @@ def extract_snapshot(repo, revision, name, staging):
 def prepare(config, version):
     require_formal(config)
     repo = Repository(config)
-    with directory_lock(config.formal), directory_lock(config.test), directory_lock(repo.path):
+    with directory_lock(config.formal), directory_lock(config.test_lock), directory_lock(repo.path):
         desktop = Desktop(config)
         desktop.require_test_idle()
         repo.fetch()
         revision, name = select_snapshot(repo, version)
         print(f"Preparing {name} from {revision}", flush=True)
-        staging = Path(mkdtemp(prefix=".preparing-", dir=config.test.parent))
+        config.test.parent.mkdir(parents=True, exist_ok=True)
+        staging = Path(mkdtemp(prefix=config.scratch_prefix("preparing"), dir=config.test.parent))
         candidate, previous = staging / "home", staging / "previous-home"
         try:
             snapshot = extract_snapshot(repo, revision, name, staging)
@@ -223,6 +225,111 @@ def prune_promotion_backups(current):
                   file=sys.stderr)
 
 
+def copy_workspace_paths(home):
+    """Include log-only roots, even for archived threads and chats added during the desktop test."""
+    with connect(home / DATABASES[0]) as db:
+        paths = {cwd for cwd, in db.execute("SELECT DISTINCT cwd FROM threads") if cwd}
+    with connect(home / DATABASES[2]) as db:
+        paths.update(cwd for (host, _), (_, cwd) in catalog_rows(db).items() if host == "local" and cwd)
+    for directory in LOG_DIRECTORIES:
+        for log in (home / directory).rglob("*"):
+            if log.resolve() != log or is_redirected(log.lstat()):
+                raise ValueError(f"Redirected rollout in {home}: {log}")
+            if log.is_file():
+                for _, record in records(log):
+                    for _, values in workspace_fields(record):
+                        paths.update(values)
+    return paths
+
+
+def referenced_copy_paths(root, *homes):
+    paths = set()
+    for home in homes:
+        for value in copy_workspace_paths(home):
+            path = Path(value)
+            if path.is_absolute() and path.is_dir():
+                paths.update(p for p in (path, path.resolve()) if p.is_relative_to(root))
+    return paths
+
+
+def remove_test_runtime(path, keep):
+    if path in keep:
+        print(f"Kept referenced path: {path}")
+    elif any(p.is_relative_to(path) for p in keep):
+        if path.is_dir() and path.resolve() == path:
+            for child in path.iterdir():
+                remove_test_runtime(child, keep)
+    elif path.is_symlink() or not path.is_dir():
+        path.unlink()
+    elif is_redirected(path.lstat()):
+        path.rmdir()  # Unlink the Windows junction itself.
+    else:
+        remove_scratch(path)
+
+
+def cleanup_after_promotion(config, references):
+    root = config.test.parent
+    if not root.exists():
+        return
+    try:
+        if root.resolve() != root or is_redirected(root.lstat()):
+            raise ValueError(f"Redirected copy directory: {root}")
+        protected = references | {config.formal, config.backups, config.checkout, PROJECT, Path.cwd(), config.history_view}
+        if root in references:
+            print(f"Kept the copy directory because it is a session workspace: {root}")
+            return
+
+        scratch = "|".join(re.escape(config.scratch_prefix(op)) for op in ("session-repair", "history-check", "preparing"))
+        legacy_lock = f"{config.test.name}.codex-migration.lock"
+        test_log = f"{config.test.name}-desktop.log"
+        for entry in root.iterdir():
+            if entry.resolve() != entry or is_redirected(entry.lstat()):
+                continue
+            if entry != config.test and any(path.is_relative_to(entry) for path in protected):
+                if config.dedicated_copy:
+                    print(f"Kept referenced path: {entry}")
+                continue
+            try:
+                if entry == config.test:
+                    # A completed file-by-file promotion has moved every session file out.
+                    if any((entry / rel).exists() for rel in promotion_session_paths(entry)):
+                        raise ValueError(f"The test home still contains session data: {entry}")
+                    remove_test_runtime(entry, protected)
+                elif entry.is_dir() and re.fullmatch(f"(?:{scratch})[a-z0-9_]{{8}}", entry.name):
+                    children = {child.name for child in entry.iterdir()}
+                    # A failed prepare can leave the only copy of a previous test home here.
+                    if "previous-home" in children:
+                        print(f"Kept previous test home in {entry}")
+                    elif all(SNAPSHOT_NAME.fullmatch(name) or name in {
+                            "home", "input", "repaired", "previous", "baseline", "candidate", "without-override",
+                    } for name in children):
+                        remove_scratch(entry)
+                elif entry.is_file() and (entry.name == test_log or
+                        config.dedicated_copy and entry.name == legacy_lock and entry.stat().st_size == 0):
+                    entry.unlink()
+                elif (config.dedicated_copy and entry.is_file()
+                      and re.fullmatch(r"workspace-map-codex-git-[0-9]{8}-[0-9]{6}\.json", entry.name)):
+                    destination = root.parent / entry.name
+                    if not destination.exists():
+                        os.link(entry, destination)  # Same filesystem, fail rather than overwrite.
+                    if entry.samefile(destination):
+                        entry.unlink()
+                        print(f"Saved workspace mapping at {destination}")
+                elif config.dedicated_copy and entry.name == ".codex-history-view" and entry.is_dir():
+                    if not any(entry.iterdir()):
+                        entry.rmdir()
+            except OSError as error:
+                print(f"WARNING: Could not clean {entry}: {error}", file=sys.stderr)
+        if config.dedicated_copy and root not in protected:
+            if not any(root.iterdir()):
+                root.rmdir()
+                print(f"Removed test copy directory: {root}")
+            else:
+                print(f"Remaining entries in {root}: " + ", ".join(sorted(p.name for p in root.iterdir())))
+    except (OSError, ValueError, sqlite3.Error) as error:
+        print(f"WARNING: Promotion data is in place. Copy cleanup stopped: {error}", file=sys.stderr)
+
+
 def windows_move_blocked(error):
     return sys.platform == "win32" and getattr(error, "winerror", None) in (5, 32)
 
@@ -320,7 +427,7 @@ def promote(config, desktop=None):
     if not (config.test / "config.toml").is_file():
         raise ValueError(f"Missing Codex configuration in {config.test}. Run prepare first.")
     desktop = desktop or Desktop(config)
-    with directory_lock(config.formal), directory_lock(config.test):
+    with directory_lock(config.formal), directory_lock(config.test_lock):
         validate_copy(config.test)
         config.backups.mkdir(parents=True, exist_ok=True)
         parents = (config.formal.parent, config.formal, config.test.parent, config.test, config.backups)
@@ -333,16 +440,26 @@ def promote(config, desktop=None):
             for home in (config.formal, config.test, config.backups):
                 if home.resolve() != home or is_redirected(home.lstat()):
                     raise ValueError(f"Use a physical directory for promotion: {home}")
+            try:
+                references = referenced_copy_paths(config.test.parent, config.formal, config.test)
+            except (OSError, ValueError, sqlite3.Error) as error:
+                print(f"WARNING: Could not check workspace references. Keeping the test runtime: {error}",
+                      file=sys.stderr)
+                references = None
             backup_dir = config.backups / f"codex-{config.timestamp()}"
             backup_dir.mkdir()
             previous = backup_dir / "codex"
-            session_files_only = False
+            session_files_only = references is None or any(
+                path.is_relative_to(config.test) or path == config.test.parent for path in references)
+            if session_files_only and references is not None:
+                print("Moving session files individually to preserve a workspace in the test copy.")
             try:
                 formal_moved = False
                 try:
-                    rename_for_promotion(config.formal, previous)
-                    formal_moved = True
-                    rename_for_promotion(config.test, config.formal)
+                    if not session_files_only:
+                        rename_for_promotion(config.formal, previous)
+                        formal_moved = True
+                        rename_for_promotion(config.test, config.formal)
                 except OSError as error:
                     if not windows_move_blocked(error):
                         raise
@@ -355,6 +472,7 @@ def promote(config, desktop=None):
                     print(f"Windows blocked a directory move. Moving session files individually. Details: {error}",
                           flush=True)
                     session_files_only = True
+                if session_files_only:
                     promote_session_files(config, previous)
                 else:
                     rewrite_rollouts(config.test, config.formal)
@@ -382,14 +500,9 @@ def promote(config, desktop=None):
             print(f"Previous formal data: {previous}")
             if session_files_only:
                 print("The backup contains the replaced session files and desktop metadata.")
-                print(f"Remaining test runtime files and settings: {config.test}")
         prune_promotion_backups(backup_dir)
-        test_log = config.test.parent / f"{config.test.name}-desktop.log"
-        try:
-            if test_log.is_file() and test_log.resolve() == test_log and not is_redirected(test_log.lstat()):
-                test_log.unlink()
-        except OSError as error:
-            print(f"WARNING: Could not remove the test desktop log {test_log}: {error}", file=sys.stderr)
+        if references is not None:
+            cleanup_after_promotion(config, references)
 
 
 def elevated_promotion(config_file):
@@ -468,7 +581,7 @@ def run(args, config, config_file):
         case "status":
             Desktop(config).status()
         case "test":
-            with directory_lock(config.formal), directory_lock(config.test):
+            with directory_lock(config.formal), directory_lock(config.test_lock):
                 validate_copy(config.test)
                 Desktop(config).require_test_idle()
                 verify(config, args, extract_snapshot)
@@ -483,7 +596,7 @@ def run(args, config, config_file):
         case "purge-backup":
             purge_backup(config, args.directory)
         case action:
-            with directory_lock(config.formal), directory_lock(config.test):
+            with directory_lock(config.formal), directory_lock(config.test_lock):
                 desktop = Desktop(config)
                 if action == "restore":
                     desktop.stop()

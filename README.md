@@ -83,7 +83,7 @@ Run the commands from the project directory in a terminal outside Codex. The exa
    python codex_session_migrate.py test --check-only
    ~~~
 
-   The mapping file is a private UTF-8 JSON object. For example, `{"/work/example": "D:/projects/example", "/work/retired": null}` maps one project and preserves history-only access to another. A null mapping uses an empty viewing directory for the working directory and removes that root from the runtime workspace list. To continue in that project later, rerun repair with its real directory. Omit `--map` when the existing paths are usable. With a custom configuration, pass the same `--config` to each command.
+   The mapping file is a private UTF-8 JSON object. Keep it outside the test copy if you want to reuse it. For example, `{"/work/example": "D:/projects/example", "/work/retired": null}` maps one project and preserves history-only access to another. A null mapping uses a stable, empty directory beside the formal home (normally `~/.codex-history-view`) and removes that root from the runtime workspace list. Choose persistent project directories outside the test home. To continue in a history-only project later, rerun repair with its real directory. Omit `--map` when the existing paths are usable. With a custom configuration, pass the same `--config` to each command.
 
 4. **Launch the verified test instance.** From an external terminal, run `test`. On Windows and macOS, fully quit Codex before running the command.
 
@@ -103,7 +103,9 @@ Run the commands from the project directory in a terminal outside Codex. The exa
 
 After a successful `promote`, the previous data is saved under `backup_root/codex-YYYYMMDD-HHMMSS/codex`. This holds either the original active home or the files replaced during a Windows file-by-file promotion. Once the new data is in place and its log paths are updated, the toolkit permanently deletes older promotion backups in `backup_root` and keeps the one it just made. Git snapshot retention is controlled separately by `repository.keep`.
 
-Promotion moves the existing test home into the active location on the same filesystem. If Windows blocks a directory move, promotion restores the active directory and moves the session logs, indexes, desktop project state, and attachments individually. The active runtime packages, plugins, settings, and credentials stay in place. The test home may still contain runtime files and settings after this switch. If a file move fails, the toolkit attempts to reverse the completed moves and reports the failing path. Promotion removes the test launch log and keeps workspace mappings, the history-only viewing directory, and staging data retained after failed repairs.
+Promotion normally moves the test home into the active location. If Windows blocks the directory move or a session still uses a workspace in the test copy, the toolkit moves session logs, indexes, desktop project state and attachments individually. If a file move fails, it attempts to reverse the completed moves and leaves the test data available for retry.
+
+After a successful promotion the toolkit removes the test runtime, launch log and migration staging directories, including earlier failed repairs. It removes the default `~/.codex_copy` directory once empty. The next `prepare` recreates it. A custom test path can share its parent with other data, so cleanup only removes its own files there. Files outside the tool's recognized layout and workspaces referenced by the promoted sessions or rollback backup are kept. An older migration may still use `.codex_copy/.codex-history-view`. A private `workspace-map-codex-git-YYYYMMDD-HHMMSS.json` in the default copy is saved beside it when the name is available.
 
 ### History verification
 

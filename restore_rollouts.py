@@ -362,7 +362,7 @@ def catalog_rows(db):
 
 
 class Workspaces:
-    def __init__(self, snapshot, supplied, viewing):
+    def __init__(self, snapshot, supplied, viewing, *, legacy_view=None):
         if not isinstance(supplied, dict) or supplied.keys() - snapshot.places.keys():
             raise ValueError("Mapping must be a JSON object keyed by exact source workspace paths from repair --plan")
         self.targets = {}
@@ -382,6 +382,8 @@ class Workspaces:
                 target = supplied[v]
                 if target is not None and (not isinstance(target, str) or not local_directory(target)):
                     raise ValueError(f"{v}: mapping target must be an existing absolute local directory or null")
+            elif legacy_view is not None and Path(v).is_absolute() and Path(v).resolve() == legacy_view:
+                target = None
             elif local_directory(v):
                 target = v
                 if aliases:

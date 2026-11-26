@@ -230,10 +230,10 @@ def swap_candidate(candidate, test, work):
 def repair(args, config, extract):
     if args.test_home and args.test_home.expanduser().resolve() != config.test:
         raise ValueError(f"Supplied test home differs from the configured test home: {config.test}")
-    with directory_lock(config.test), directory_lock(config.checkout):
+    with directory_lock(config.test_lock), directory_lock(config.checkout):
         Desktop(config).require_test_idle()
         repo, info = provenance(config)
-        work = Path(mkdtemp(prefix=".session-repair-", dir=config.test.parent))
+        work = Path(mkdtemp(prefix=config.scratch_prefix("session-repair"), dir=config.test.parent))
         try:
             extracted = extract(repo, info["commit"], info["snapshot"], work)
             if not args.plan:
@@ -245,7 +245,13 @@ def repair(args, config, extract):
             else:
                 recover_interrupted_tail(source)
                 supplied = json.loads(args.map.read_text(encoding="utf-8-sig")) if args.map else {}
-                maps = Workspaces(source, supplied, config.test.parent / ".codex-history-view")
+                legacy = config.test.parent / ".codex-history-view"
+                maps = Workspaces(source, supplied, config.history_view,
+                                  legacy_view=legacy if legacy != config.history_view else None)
+                for target in maps.targets.values():
+                    if target is not None and Path(target).resolve().is_relative_to(config.test):
+                        raise ValueError(f"Workspace {target} is inside the disposable test home. "
+                                         "Map it to a persistent directory or choose null for history-only viewing.")
                 binary, version = select_client(args, info, config)
                 candidate = work / "repaired"
                 inputs = work / "input"
@@ -299,7 +305,7 @@ def verify(config, args, extract):
         if not {"client_version", "workspaces", "overrides"} <= info.keys():
             raise ValueError("Prepared snapshot awaits workspace repair and client verification. Run repair first.")
         binary, version = select_client(args, info, config)
-        with TemporaryDirectory(prefix=".history-check-", dir=config.test.parent) as temp:
+        with TemporaryDirectory(prefix=config.scratch_prefix("history-check"), dir=config.test.parent) as temp:
             work = Path(temp)
             extracted = extract(repo, info["commit"], info["snapshot"], work)
             match_local_migrations(extracted, config.formal)
