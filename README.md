@@ -101,9 +101,9 @@ Run the commands from the project directory in a terminal outside Codex. The exa
 
 ### Local rollback backup
 
-After a successful `promote`, the previous active directory is saved under `backup_root/codex-YYYYMMDD-HHMMSS/codex`. Once the new directory is in place and its log paths are updated, the toolkit permanently deletes older promotion backups in `backup_root` and keeps the one it just made. Git snapshot retention is controlled separately by `repository.keep`.
+After a successful `promote`, the previous data is saved under `backup_root/codex-YYYYMMDD-HHMMSS/codex`. This holds either the original active home or the files replaced during a Windows file-by-file promotion. Once the new data is in place and its log paths are updated, the toolkit permanently deletes older promotion backups in `backup_root` and keeps the one it just made. Git snapshot retention is controlled separately by `repository.keep`.
 
-The test home is moved into the active location, which releases its old path without duplicating its data. Promotion removes the test launch log and keeps the parent directory, including workspace mappings, the history-only viewing directory and any staging data retained after failed repairs.
+Promotion moves the existing test home into the active location on the same filesystem. If Windows blocks a directory move, promotion restores the active directory and moves the session logs, indexes, desktop project state, and attachments individually. The active runtime packages, plugins, settings, and credentials stay in place. The test home may still contain runtime files and settings after this switch. If a file move fails, the toolkit attempts to reverse the completed moves and reports the failing path. Promotion removes the test launch log and keeps workspace mappings, the history-only viewing directory, and staging data retained after failed repairs.
 
 ### History verification
 

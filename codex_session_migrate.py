@@ -9,6 +9,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory, mkdtemp
@@ -20,7 +21,7 @@ from codex_session_common import (
     Repository, check_database, connect, directory_lock, is_redirected, load_config, rollout_relative,
 )
 from prepare_codex_copy import stage_copy
-from restore_snapshot import pin, repair, verify
+from restore_snapshot import RECEIPT, pin, repair, verify
 
 
 COMMAND_ERRORS = (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError, EOFError)
@@ -222,6 +223,98 @@ def prune_promotion_backups(current):
                   file=sys.stderr)
 
 
+def windows_move_blocked(error):
+    return sys.platform == "win32" and getattr(error, "winerror", None) in (5, 32)
+
+
+def rename_for_promotion(source, destination):
+    for delay in (0.15, 0.35, 0.75, None):
+        try:
+            source.rename(destination)
+            return
+        except OSError as error:
+            if delay is None or not windows_move_blocked(error):
+                raise
+            time.sleep(delay)
+
+
+def promotion_session_paths(home):
+    def walk_error(error):
+        raise error
+
+    paths = {
+        *(Path(name) for name in (*SESSION_FILES, RECEIPT, ".codex-global-state.json",
+                                  ".codex-global-state.json.bak", ".codex-global-state.sqlite")),
+        *(Path(name + suffix) for name in (*DATABASES, ".codex-global-state.sqlite")
+          for suffix in ("-wal", "-shm", "-journal")),
+    }
+    for directory in (*LOG_DIRECTORIES, "attachments"):
+        base = home / directory
+        if base.is_symlink() or base.resolve() != base:
+            raise ValueError(f"Redirected session directory: {base}")
+        if not base.exists():
+            continue
+        if not base.is_dir():
+            raise ValueError(f"Expected a session directory: {base}")
+        for folder, directories, files in os.walk(base, onerror=walk_error):
+            root = Path(folder)
+            for name in directories + files:
+                entry = root / name
+                if is_redirected(entry.lstat()):
+                    raise ValueError(f"Redirected session path: {entry}")
+            paths.update((root / name).relative_to(home) for name in files)
+    return paths
+
+
+def promote_session_files(config, previous):
+    formal, test = config.formal, config.test
+    state = test / DATABASES[0]
+    # The path rewrite opens this database after moving it. Finish its WAL
+    # first so that opening it cannot consume sidecars needed for rollback.
+    try:
+        with connect(state, "rw") as db:
+            if db.execute("PRAGMA journal_mode=DELETE").fetchone()[0] != "delete":
+                raise ValueError(f"Could not finish the SQLite journal for {state}")
+    except sqlite3.Error as error:
+        raise ValueError(f"Could not finish the SQLite journal for {state}: {error}") from error
+
+    paths = sorted(promotion_session_paths(formal) | promotion_session_paths(test))
+    files = {}
+    for home in (formal, test):
+        files[home] = []
+        for relative in paths:
+            entry = home / relative
+            if entry.resolve() != entry or entry.is_symlink():
+                raise ValueError(f"Redirected session path: {entry}")
+            if entry.exists():
+                if not entry.is_file():
+                    raise ValueError(f"Expected a session file: {entry}")
+                files[home].append(relative)
+
+    saved, installed = [], []
+    try:
+        for source, target, moved in ((formal, previous, saved), (test, formal, installed)):
+            for relative in files[source]:
+                destination = target / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                rename_for_promotion(source / relative, destination)
+                moved.append(relative)
+        rewrite_rollouts(test, formal)
+    except BaseException:
+        try:
+            for source, target, moved in ((formal, test, installed), (previous, formal, saved)):
+                for relative in reversed(moved):
+                    rename_for_promotion(source / relative, target / relative)
+        except OSError as error:
+            raise ValueError(f"Session-file rollback stopped. Check {formal}, {test}, and {previous}.") from error
+        for directory, _, _ in os.walk(previous, topdown=False):
+            folder = Path(directory)
+            if not any(folder.iterdir()):
+                folder.rmdir()
+        print(f"Restored the formal and test session files: {formal} and {test}", file=sys.stderr)
+        raise
+
+
 def promote(config, desktop=None):
     require_formal(config)
     if not (config.test / "config.toml").is_file():
@@ -243,30 +336,53 @@ def promote(config, desktop=None):
             backup_dir = config.backups / f"codex-{config.timestamp()}"
             backup_dir.mkdir()
             previous = backup_dir / "codex"
+            session_files_only = False
             try:
-                config.formal.rename(previous)
-                config.test.rename(config.formal)
-                rewrite_rollouts(config.test, config.formal)
+                formal_moved = False
+                try:
+                    rename_for_promotion(config.formal, previous)
+                    formal_moved = True
+                    rename_for_promotion(config.test, config.formal)
+                except OSError as error:
+                    if not windows_move_blocked(error):
+                        raise
+                    if formal_moved:
+                        if config.formal.exists():
+                            raise
+                        rename_for_promotion(previous, config.formal)
+                    if not config.formal.is_dir() or previous.exists():
+                        raise
+                    print(f"Windows blocked a directory move. Moving session files individually. Details: {error}",
+                          flush=True)
+                    session_files_only = True
+                    promote_session_files(config, previous)
+                else:
+                    rewrite_rollouts(config.test, config.formal)
             except BaseException as failure:
-                if previous.exists():
+                if not session_files_only and previous.exists():
                     try:
                         if config.formal.exists():
-                            config.formal.rename(backup_dir / "promoted-failed-codex")
-                        previous.rename(config.formal)
+                            rename_for_promotion(config.formal, backup_dir / "promoted-failed-codex")
+                        rename_for_promotion(previous, config.formal)
                     except OSError as error:
                         raise ValueError(f"Automatic rollback failed. Check the directories under {backup_dir}.") from error
-                    print(f"Restored the formal directory. Check {backup_dir} for the failed copy.", file=sys.stderr)
-                else:
-                    try:
-                        backup_dir.rmdir()
-                    except OSError:
-                        pass
-                if getattr(failure, "winerror", None) == 32:
-                    raise ValueError(f"A Windows process still holds a promotion directory open. Close its file "
-                                     f"handles and retry. Details: {failure}") from failure
+                    print(f"Restored the formal directory: {config.formal}", file=sys.stderr)
+                    failed_copy = backup_dir / "promoted-failed-codex"
+                    if failed_copy.exists():
+                        print(f"Test home from the failed move is available at {failed_copy}", file=sys.stderr)
+                try:
+                    backup_dir.rmdir()
+                except OSError:
+                    pass
+                if windows_move_blocked(failure):
+                    raise ValueError(f"Windows blocked a promotion file operation after retries. Close applications "
+                                     f"using the reported path and retry. Details: {failure}") from failure
                 raise
             print(f"Promoted {config.test} to {config.formal}")
             print(f"Previous formal data: {previous}")
+            if session_files_only:
+                print("The backup contains the replaced session files and desktop metadata.")
+                print(f"Remaining test runtime files and settings: {config.test}")
         prune_promotion_backups(backup_dir)
         test_log = config.test.parent / f"{config.test.name}-desktop.log"
         try:
@@ -300,11 +416,14 @@ def elevated_promotion(config_file):
         encoded = base64.b64encode(command.encode("utf-16-le")).decode("ascii")
         print("Approve the Windows prompt to stop the Codex sandbox service and promote the copy.", flush=True)
         result = subprocess.run([str(powershell), "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded])
-        if log.is_file():
+        worker_started = log.is_file()
+        if worker_started:
             print(log.read_text(encoding="utf-8"), end="", flush=True)
         if result.returncode:
-            raise ValueError("Elevated promotion failed. Approve the prompt using the current Windows account and "
-                             "check any error above.")
+            if worker_started:
+                raise SystemExit(result.returncode)
+            raise ValueError("Could not start the administrator process. Check the Windows prompt and use the "
+                             "current Windows account.")
 
 
 def promote_and_launch(args, config, config_file):

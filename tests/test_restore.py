@@ -222,6 +222,80 @@ class Snapshots(unittest.TestCase):
         (previous,) = config.backups.glob("codex-*/codex")
         self.assertTrue((previous / cli.DATABASES[0]).is_file())
 
+    @unittest.skipUnless(os.name == "nt", "Windows rejects directory moves with open descendants")
+    def test_promote_rolls_back_when_a_session_file_is_locked(self):
+        config = Config(self.source, self.dest, self.root / "backups", self.root / "git", "unused",
+                        "main", 5, 0)
+        (self.dest / "config.toml").touch()
+        with database(self.dest / cli.DATABASES[0]) as db:
+            for tid, relative in ((LIVE, rollout(LIVE, LAST)), (ARCHIVE, rollout(ARCHIVE, archived=True, compressed=True))):
+                db.execute("UPDATE threads SET rollout_path=? WHERE id=?", (str(self.dest / relative), tid))
+
+        original_id = self.source.stat().st_ino
+        test_id = self.dest.stat().st_ino
+        stderr = io.StringIO()
+        with (
+            patch.object(cli, "suspend_windows_sandbox", contextlib.nullcontext),
+            patch.object(cli.Desktop, "stop_for_promotion"),
+            patch.object(cli.time, "sleep") as retry_wait,
+            patch.object(cli.shutil, "copytree", side_effect=AssertionError("Promotion must move existing data")),
+            contextlib.redirect_stderr(stderr),
+        ):
+            with (self.dest / rollout(LIVE, LAST)).open("rb"):
+                with self.assertRaisesRegex(ValueError, "blocked a promotion file operation after retries"):
+                    cli.promote(config)
+            self.assertGreaterEqual(retry_wait.call_count, 3)
+            self.assertIn("Restored the formal and test session files", stderr.getvalue())
+            self.assertEqual(self.source.stat().st_ino, original_id)
+            self.assertEqual(self.dest.stat().st_ino, test_id)
+            self.assertEqual(list(config.backups.iterdir()), [])
+            cli.validate_copy(self.dest)
+            cli.promote(config)
+
+        self.assertFalse(self.dest.exists())
+        self.assertEqual(self.source.stat().st_ino, test_id)
+        cli.validate_copy(config.formal)
+        (previous,) = config.backups.glob("codex-*/codex")
+        self.assertEqual(previous.stat().st_ino, original_id)
+
+    @unittest.skipUnless(os.name == "nt", "Windows rejects directory moves with open descendants")
+    def test_promote_moves_session_files_when_runtime_file_is_locked(self):
+        config = Config(self.source, self.dest, self.root / "backups", self.root / "git", "unused",
+                        "main", 5, 0)
+        for home in (self.source, self.dest):
+            (home / "packages").mkdir()
+            (home / "packages" / "runtime").write_text(home.name, encoding="utf-8")
+            (home / "attachments").mkdir()
+            (home / "attachments" / "fixture").write_text(home.name, encoding="utf-8")
+            (home / "config.toml").write_text(home.name, encoding="utf-8")
+            (home / ".codex-global-state.json").write_text(home.name, encoding="utf-8")
+        with database(self.dest / cli.DATABASES[0]) as db:
+            for tid, relative in ((LIVE, rollout(LIVE, LAST)), (ARCHIVE, rollout(ARCHIVE, archived=True, compressed=True))):
+                db.execute("UPDATE threads SET rollout_path=? WHERE id=?", (str(self.dest / relative), tid))
+
+        active_id = self.source.stat().st_ino
+        candidate_log_id = (self.dest / rollout(LIVE, LAST)).stat().st_ino
+        with (
+            (self.dest / "packages" / "runtime").open("rb"),
+            patch.object(cli, "suspend_windows_sandbox", contextlib.nullcontext),
+            patch.object(cli.Desktop, "stop_for_promotion"),
+            patch.object(cli.time, "sleep"),
+            patch.object(cli.shutil, "copytree", side_effect=AssertionError("Promotion must move existing data")),
+        ):
+            cli.promote(config)
+
+        self.assertEqual(self.source.stat().st_ino, active_id)
+        self.assertEqual((self.source / rollout(LIVE, LAST)).stat().st_ino, candidate_log_id)
+        self.assertFalse((self.dest / rollout(LIVE, LAST)).exists())
+        cli.validate_copy(config.formal)
+        (previous,) = config.backups.glob("codex-*/codex")
+        for name in ("packages/runtime", "config.toml"):
+            self.assertEqual((self.source / name).read_text(encoding="utf-8"), "source")
+            self.assertFalse((previous / name).exists())
+        for name in ("attachments/fixture", ".codex-global-state.json"):
+            self.assertEqual((self.source / name).read_text(encoding="utf-8"), "dest")
+            self.assertEqual((previous / name).read_text(encoding="utf-8"), "source")
+
     def test_mapping_round_trip_and_indexes(self):
         src = Snapshot(self.source)
         with self.assertRaisesRegex(ValueError, "Confirm mappings"):
