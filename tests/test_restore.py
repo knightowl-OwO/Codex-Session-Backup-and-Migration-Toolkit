@@ -35,7 +35,7 @@ def rollout(tid, segment=None, archived=False, compressed=False):
                          ("_" + segment if segment else "") + (".jsonl.zst" if compressed else ".jsonl"))
 
 
-def segment(home, path, tid, turn_num, base, workspace):
+def segment(home, path, tid, turn_num, base, workspace, metadata=False):
     start = base["end_ordinal_exclusive"] if base else 0
     meta = dict(id=tid, session_id=tid, timestamp=TS, cwd=workspace,
                 originator="codex_cli_rs", cli_version="0.171.0-alpha.13", source="cli",
@@ -52,6 +52,12 @@ def segment(home, path, tid, turn_num, base, workspace):
               ("event_msg", {"type": "item_completed", "thread_id": tid, "turn_id": turn, "item": user}),
               ("event_msg", {"type": "item_completed", "thread_id": tid, "turn_id": turn, "item": agent}),
               ("event_msg", {"type": "task_complete", "turn_id": turn, "last_agent_message": text})]
+    if metadata:
+        events.extend([
+            ("world_state", {"full": True, "state": {"environments": [workspace]}}),
+            ("token_usage_record", {"turn_id": turn, "usage": {}}),
+            ("inter_agent_communication_metadata", {"trigger_turn": turn}),
+        ])
     lines = [json.dumps(dict(timestamp=TS, ordinal=start + i, type=t, payload=v)).encode() + b"\r\n"
              for i, (t, v) in enumerate(events)]
     data = b"".join(lines)
@@ -62,7 +68,7 @@ def segment(home, path, tid, turn_num, base, workspace):
     u = {"type": "userMessage", "id": uid, "clientId": None, "content": user["content"]}
     a = {"type": "agentMessage", "id": aid, "text": text, "phase": "final_answer",
          "memoryCitation": None, "moderation": None, "delivery": None, "questions": []}
-    return boundary, (boundary["thread_id"], turn, start + 1, len(lines[0]), start + 4, len(data), u, a)
+    return boundary, (boundary["thread_id"], turn, start + 1, len(lines[0]), start + 4, sum(map(len, lines[:5])), u, a)
 
 
 def fixture(home, workspace=WINDOWS, binary=None):
@@ -86,7 +92,8 @@ def fixture(home, workspace=WINDOWS, binary=None):
                        (ARCHIVE, [rollout(ARCHIVE, archived=True, compressed=True)])]:
         base = None
         for path in paths:
-            base, row = segment(home, path, tid, 400 + len(rows), base, workspace)
+            base, row = segment(home, path, tid, 400 + len(rows), base, workspace,
+                                metadata=not binary and path == rollout(LIVE, MIDDLE, compressed=True))
             rows.append(row)
     if binary:
         with app_server(binary, home, home.parent) as call:
@@ -279,8 +286,9 @@ class RealClient(unittest.TestCase):
             new_project.mkdir()
             maps = Workspaces(model, {WINDOWS: str(new_project), str(project): str(new_project)}, root / "view")
             used = rewrite_logs(model, copied, maps, prefer_override=True)
-            self.assertEqual(used, {LIVE})
-            self.assertTrue((copied / model.threads[LIVE].path).read_bytes().startswith(raw))
+            self.assertEqual(used, set() if os.name == "nt" else {LIVE})
+            if used:
+                self.assertTrue((copied / model.threads[LIVE].path).read_bytes().startswith(raw))
             update_indexes(model, copied)
             relocate(model, copied, copied, maps)
             target = Snapshot(copied)
@@ -298,7 +306,7 @@ class RealClient(unittest.TestCase):
             source = remote / name
             fixture(source, binary=SERVER)
             def git(*args):
-                subprocess.run(["git", "-C", str(remote), *args], check=True, capture_output=True)
+                subprocess.run(["git", "-c", "core.autocrlf=false", "-C", str(remote), *args], check=True, capture_output=True)
             git("init", "-q", "-b", "main")
             (remote / ".gitattributes").write_text("*.zst export-ignore\n", encoding="ascii")
             git("add", "--", ".gitattributes")

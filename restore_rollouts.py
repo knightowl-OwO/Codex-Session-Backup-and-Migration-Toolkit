@@ -5,6 +5,7 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 from array import array
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -15,7 +16,10 @@ from codex_session_common import DATABASES, LOG_DIRECTORIES, check_database, con
 UUID = r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"
 ROLLOUT = re.compile(rf"rollout-.+?-({UUID})(?:_({UUID}))?\.jsonl(?:\.zst)?")
 ROOT_FIELDS = ("workspace_roots", "runtime_workspace_roots")
-RECORDS = {"session_meta", "turn_context", "event_msg", "response_item", "compacted"}
+RECORDS = {
+    "session_meta", "turn_context", "event_msg", "response_item", "compacted",
+    "world_state", "token_usage_record", "inter_agent_communication_metadata",
+}
 
 
 def log_bytes(path, data=None):
@@ -66,8 +70,10 @@ def records(path):
     for number, line in enumerate(record_lines(path), 1):
         try:
             data = json.loads(line)
-            if data["type"] not in RECORDS or not isinstance(data["payload"], dict):
-                raise ValueError("unsupported record type or payload")
+            if data["type"] not in RECORDS:
+                raise ValueError(f"unsupported record type {data['type']!r}")
+            if not isinstance(data["payload"], dict):
+                raise ValueError(f"{data['type']} payload must be a JSON object")
             if number == 1 and data["type"] != "session_meta":
                 raise ValueError("first record must be session_meta")
         except (ValueError, KeyError, TypeError) as exc:
@@ -137,6 +143,11 @@ class Segment:
     base: dict | None
     start: int
     session: str | None
+    # Older writers could restart the on-disk ordinal sequence at a segment boundary.
+    log_start: int
+    fork_parent: str | None
+    fork_boundary: int | None
+    embedded_parent: str | None = None
     turns: list = field(default_factory=list)
     messages: list = field(default_factory=list)
     workspace_events: list = field(default_factory=list)
@@ -159,6 +170,7 @@ class Thread:
     cwd: str
     chain: list
     attached_to: str | None
+    spawn_parent: str | None
 
     def visible_records(self, attribute):
         for i, seg in enumerate(self.chain):
@@ -172,11 +184,11 @@ class Thread:
         return list(self.visible_records("turns"))
 
     def effective_roots(self):
-        roots = context = None
+        roots = None
         for fields in self.visible_records("workspace_events"):
             roots = fields.get("runtime_workspace_roots", roots)
-            context = fields.get("workspace_roots", context)
-        return roots if roots is not None else context
+        # turn_context.workspace_roots describes the historic turn, not the default on resume.
+        return roots if roots is not None else [self.cwd]
 
 
 class Snapshot:
@@ -213,11 +225,19 @@ class Snapshot:
                             or any(type(base[k]) is not int or base[k] < 0 for k in ("end_ordinal_exclusive", "end_byte_offset"))
                         ):
                             raise ValueError(f"{owner}: unknown history_base in {path.name}")
+                        start = base["end_ordinal_exclusive"] if base else 0
+                        log_start = data.get("ordinal", start)
+                        if type(log_start) is not int or not 0 <= log_start <= start:
+                            raise ValueError(f"{owner}, {path.name}: invalid initial log ordinal {log_start}")
                         segment = Segment(path.relative_to(home), owner, suffix or owner, base,
-                                          base["end_ordinal_exclusive"] if base else 0, meta.get("session_id"))
+                                          start, meta.get("session_id"), log_start,
+                                          meta.get("forked_from_id"), meta.get("forked_from_ordinal_exclusive"))
+                    if i == 1 and data["type"] == "session_meta" and segment.fork_parent == data["payload"].get("id"):
+                        segment.embedded_parent = segment.fork_parent
                     ordinal = segment.start + i
-                    if "ordinal" in data and (type(data["ordinal"]) is not int or data["ordinal"] != ordinal):
-                        raise ValueError(f"{owner}, {path.name}: expected log ordinal {ordinal}, found {data['ordinal']}")
+                    log_ordinal = segment.log_start + i
+                    if "ordinal" in data and (type(data["ordinal"]) is not int or data["ordinal"] != log_ordinal):
+                        raise ValueError(f"{owner}, {path.name}: expected log ordinal {log_ordinal}, found {data['ordinal']}")
                     payload = data["payload"]
                     if (data["type"] == "event_msg" and payload.get("type") in ("item_started", "item_completed")
                             and "thread_id" in payload and payload["thread_id"] not in (owner, segment.key)):
@@ -240,7 +260,7 @@ class Snapshot:
                         if fields:
                             segment.workspace_events.append((ordinal, fields))
                         if data["type"] == "event_msg" and data["payload"].get("type") == "thread_settings_applied":
-                            if data["payload"].get("thread_id") != owner:
+                            if payload.get("thread_id", owner) not in (owner, segment.key):
                                 raise ValueError("thread_settings_applied belongs to a different thread")
                             segment.saved_settings.append((ordinal, data))
                     except (KeyError, TypeError, ValueError) as exc:
@@ -252,8 +272,8 @@ class Snapshot:
         with connect(home / DATABASES[0]) as db:
             columns = {r[1] for r in db.execute("PRAGMA table_info(threads)")}
             parent = "attached_thread_parent_id" if "attached_thread_parent_id" in columns else "NULL"
-            for tid, path, archived, title, cwd, attached in db.execute(
-                f"SELECT id, rollout_path, archived, title, cwd, {parent} FROM threads"
+            for tid, path, archived, title, cwd, attached, source in db.execute(
+                f"SELECT id, rollout_path, archived, title, cwd, {parent}, source FROM threads"
             ):
                 try:
                     relative = relative_log(path)
@@ -267,7 +287,12 @@ class Snapshot:
                     chain = self.chain(entry)
                     if archived not in (0, 1) or not isinstance(cwd, str) or not cwd:
                         raise ValueError("invalid thread archive flag or cwd")
-                    self.threads[tid] = Thread(relative, bool(archived), title, cwd, chain, attached)
+                    spawn_parent = None
+                    if isinstance(source, str) and source.startswith("{"):
+                        subagent = json.loads(source).get("subagent")
+                        if isinstance(subagent, dict) and isinstance(subagent.get("thread_spawn"), dict):
+                            spawn_parent = subagent["thread_spawn"].get("parent_thread_id")
+                    self.threads[tid] = Thread(relative, bool(archived), title, cwd, chain, attached, spawn_parent)
                     self.places[cwd].add((tid, "threads.cwd"))
                 except ValueError as exc:
                     raise ValueError(f"{tid}: {exc}") from exc
@@ -276,6 +301,14 @@ class Snapshot:
         if unused:
             raise ValueError("Rollouts unreachable from source SQLite entries: " +
                              ", ".join(self.by_key[k].path.name for k in sorted(unused)))
+        with connect(home / DATABASES[1]) as db:
+            for t in self.threads.values():
+                first = t.chain[0]
+                if t.spawn_parent and t.spawn_parent == first.embedded_parent and first.owner == first.key:
+                    row = db.execute("SELECT MIN(rollout_ordinal) FROM thread_turns WHERE thread_id=?",
+                                     (first.key,)).fetchone()
+                    if row[0] is not None:
+                        first.turns = [(pos, turn) for pos, turn in first.turns if pos >= row[0]]
         with connect(home / DATABASES[2]) as db:
             self.catalog = catalog_rows(db)
         for (host, tid), (_, cwd) in self.catalog.items():
@@ -296,10 +329,18 @@ class Snapshot:
             parent = self.by_key.get(base["thread_id"])
             if base["thread_id"] in seen:
                 raise ValueError(f"{segment.owner}: cycle through segment {base['thread_id']}")
-            if (not parent or parent.owner != segment.owner
-                    or (parent.session and segment.session and parent.session != segment.session)):
+            if not parent:
+                raise ValueError(f"{segment.owner}: missing parent segment {base['thread_id']}")
+            if parent.owner != segment.owner:
+                if (segment.fork_parent != parent.owner or segment.fork_boundary != segment.start
+                        or segment.key != segment.owner):
+                    raise ValueError(f"{segment.owner}: unrelated fork parent segment {base['thread_id']}")
+            elif parent.session and segment.session and parent.session != segment.session:
                 raise ValueError(f"{segment.owner}: missing or unrelated parent segment {base['thread_id']}")
             parent.offset(base["end_ordinal_exclusive"], base["end_byte_offset"])
+            inherited = segment.start - parent.start + parent.log_start
+            if segment.log_start not in (0, segment.start, inherited):
+                raise ValueError(f"{segment.path.name}: initial log ordinal disagrees with its history_base")
             segment = parent
 
     def plan(self):
@@ -327,6 +368,15 @@ class Workspaces:
         self.targets = {}
         self.viewing = viewing
         missing = []
+        aliases = {}
+        if sys.platform == "win32":
+            for path, target in supplied.items():
+                if local_directory(path):
+                    metadata = Path(path).stat()
+                    identity = (metadata.st_dev, metadata.st_ino)
+                    if identity in aliases and aliases[identity] != target:
+                        raise ValueError(f"Conflicting mappings for the same directory: {path}")
+                    aliases[identity] = target
         for v, uses in snapshot.places.items():
             if v in supplied:
                 target = supplied[v]
@@ -334,6 +384,9 @@ class Workspaces:
                     raise ValueError(f"{v}: mapping target must be an existing absolute local directory or null")
             elif local_directory(v):
                 target = v
+                if aliases:
+                    metadata = Path(v).stat()
+                    target = aliases.get((metadata.st_dev, metadata.st_ino), v)
             else:
                 missing.append(f"{v} ({', '.join(sorted({tid for tid, _ in uses}))})")
                 continue
@@ -393,7 +446,7 @@ def replace_json_values(line, replacements):
     return text.encode("utf-8")
 
 
-def append_workspace_override(thread, target, workspaces):
+def append_workspace_override(thread, target, workspaces, *, after_rewrite=False):
     """Reuse the client's own full settings. Never synthesize permission or model settings."""
     head = thread.chain[-1]
     if thread.archived or head.path.suffix != ".jsonl" or not head.saved_settings:
@@ -401,6 +454,9 @@ def append_workspace_override(thread, target, workspaces):
     roots = thread.effective_roots()
     template = head.saved_settings[-1][1]
     saved = settings(template)
+    if after_rewrite:
+        saved = saved.copy()
+        workspaces.update({"type": "turn_context", "payload": saved})
     if (roots is None or "ordinal" not in template or "cwd" not in saved
             or "runtime_workspace_roots" not in saved):
         return False
@@ -410,7 +466,7 @@ def append_workspace_override(thread, target, workspaces):
         return False
     changes = {**saved, "cwd": cwd, "runtime_workspace_roots": mapped}
     payload = {**template["payload"], "thread_settings": changes}
-    record = {**template, "ordinal": head.start + len(head.offsets) - 1, "payload": payload}
+    record = {**template, "ordinal": head.log_start + len(head.offsets) - 1, "payload": payload}
     with (target / head.path).open("r+b") as out:
         out.seek(-1, 2)
         if out.read(1) != b"\n":
@@ -422,8 +478,10 @@ def append_workspace_override(thread, target, workspaces):
 def rewrite_logs(snapshot, target, workspaces, *, prefer_override=False):
     done = set()
     overrides = set()
+    fork_owners = {s.fork_parent for s in snapshot.segments.values() if s.fork_parent}
     for tid, thread in snapshot.threads.items():
-        if prefer_override and append_workspace_override(thread, target, workspaces):
+        shared = tid in fork_owners or any(s.owner != tid for s in thread.chain)
+        if prefer_override and not shared and sys.platform != "win32" and append_workspace_override(thread, target, workspaces):
             overrides.add(tid)
             continue
         for seg in thread.chain:
@@ -454,6 +512,8 @@ def rewrite_logs(snapshot, target, workspaces, *, prefer_override=False):
             if edited:
                 log_bytes(target / seg.path, bytes(output))
                 seg.rewritten = new_offsets
+        if not shared:
+            append_workspace_override(thread, target, workspaces, after_rewrite=True)
     return overrides
 
 
@@ -464,6 +524,38 @@ def translate(segment, ordinal, offset, end=False):
         raise ValueError(f"{segment.path.name}: invalid indexed ordinal or offset {ordinal}, {offset}")
     # Turn ends are inclusive. The byte offset is immediately after that record.
     return segment.offset(ordinal + int(end), offset)
+
+
+def recover_interrupted_tail(snapshot):
+    """Recover a logged user-only interruption missing from the pinned projection."""
+    with connect(snapshot.home / DATABASES[1], "rw") as db, db:
+        for key, ordinal in db.execute("SELECT thread_id,next_rollout_ordinal FROM thread_history_projection_state"):
+            seg = snapshot.by_key.get(key)
+            if not seg or not any(pos >= ordinal for pos, _ in seg.turns):
+                continue
+            tail = [(pos, r["payload"]) for pos, (_, r) in enumerate(records(snapshot.home / seg.path), seg.start)
+                    if pos >= ordinal and r["type"] == "event_msg" and r["payload"]["type"] != "thread_settings_applied"]
+            if [p["type"] for _, p in tail] != ["task_started", "item_completed", "turn_aborted"]:
+                continue
+            (first, start), (middle, message), (last, stop) = tail
+            turn = start["turn_id"]
+            item = message["item"]
+            if (stop["turn_id"] != turn or message["turn_id"] != turn or item["type"] != "UserMessage"
+                    or stop.get("reason") != "interrupted"
+                    or db.execute("SELECT 1 FROM thread_turns WHERE thread_id=? AND turn_id=?", (key, turn)).fetchone()):
+                continue
+            view = {"type": "userMessage", "id": item["id"], "clientId": item.get("client_id"), "content": item["content"]}
+            db.execute("""INSERT INTO thread_turns(thread_id,turn_id,rollout_ordinal,status,started_at,completed_at,
+                       duration_ms,first_user_item_id,rollout_byte_offset,rollout_end_ordinal,rollout_end_byte_offset,root_turn_id)
+                       VALUES(?,?,?,'interrupted',?,?,?,?,?,?,?,?)""",
+                       (key, turn, first, start["started_at"], stop["completed_at"], stop["duration_ms"], item["id"],
+                        seg.offsets[first-seg.start], last, seg.offsets[last-seg.start+1], start.get("root_turn_id")))
+            db.execute("""INSERT INTO thread_items(thread_id,turn_id,item_id,rollout_ordinal,created_at_ms,item_json,
+                       item_type,updated_at_ordinal,started_at_ms,completed_at_ms) VALUES(?,?,?,?,?,?,'userMessage',?,?,?)""",
+                       (key, turn, item["id"], middle, message["started_at_ms"], json.dumps(view, ensure_ascii=False),
+                        middle, message["started_at_ms"], message["completed_at_ms"]))
+            db.execute("UPDATE thread_history_projection_state SET next_rollout_ordinal=?,next_rollout_byte_offset=? "
+                       "WHERE thread_id=?", (last+1, seg.offsets[last-seg.start+1], key))
 
 
 def update_indexes(snapshot, target, *, check_only=False):
@@ -486,7 +578,15 @@ def update_indexes(snapshot, target, *, check_only=False):
                     segment = snapshot.by_key.get(tid)
                     if segment is None:
                         raise ValueError(f"{tid}: {table} row without a source segment")
-                    new = translate(segment, ordinal, old, end)
+                    if table == "thread_history_projection_state" and not check_only:
+                        # This cache can contain a stale byte cursor after an earlier relocation.
+                        # Retain its progress ordinal and reconstruct the cursor at that exact boundary.
+                        index = ordinal - segment.start
+                        if not 0 <= index < len(segment.offsets):
+                            raise ValueError(f"{tid}: projection cursor ordinal {ordinal} outside its segment")
+                        new = segment.offset(ordinal, segment.offsets[index])
+                    else:
+                        new = translate(segment, ordinal, old, end)
                     if not check_only and new != old:
                         db.execute(f"UPDATE {table} SET {col}=? WHERE rowid=?", (new, rowid))
         check_database(db, target / DATABASES[1])

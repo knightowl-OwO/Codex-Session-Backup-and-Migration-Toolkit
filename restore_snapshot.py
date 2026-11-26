@@ -1,22 +1,34 @@
 """Stage a repair and compare independent reads of its pinned source and destination."""
 
 import json
+import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory, mkdtemp
 
 from codex_desktop import Desktop
 from codex_session_common import (
-    DATABASES, LOG_DIRECTORIES, SESSION_FILES, SNAPSHOT_NAME, Repository, backup_database, directory_lock,
+    DATABASES, LOG_DIRECTORIES, SESSION_FILES, SNAPSHOT_NAME, Repository, backup_database, connect, directory_lock,
 )
 from prepare_codex_copy import stage_copy
 from restore_client import app_server, compare_history, history
-from restore_rollouts import Snapshot, Workspaces, relocate, rewrite_logs, update_indexes
+from restore_rollouts import Snapshot, Workspaces, recover_interrupted_tail, relocate, rewrite_logs, update_indexes
 
 RECEIPT = ".session-restore.json"
+
+
+def remove_scratch(path):
+    def retry(action, filename, error):
+        if os.name != "nt" or not isinstance(error[1], PermissionError) or os.path.islink(filename):
+            raise error[1]
+        os.chmod(filename, stat.S_IWRITE | stat.S_IREAD)
+        action(filename)
+    shutil.rmtree(path, onerror=retry)
 
 
 def pin(repo, revision, name, home):
@@ -56,6 +68,28 @@ def session_copy(home, target):
             shutil.copyfile(home / path, target / path)
 
 
+def match_local_migrations(extracted, formal):
+    """Adapt SQLx bookkeeping in disposable databases when the destination schema matches."""
+    migrations = "SELECT version, description, success, checksum FROM _sqlx_migrations ORDER BY version"
+    schema = "SELECT type, name, replace(sql, char(13)||char(10), char(10)) FROM sqlite_schema ORDER BY type, name"
+    for name in DATABASES[:2]:
+        if not (formal / name).is_file():
+            continue
+        with connect(extracted / name, "rw") as src, connect(formal / name) as ref:
+            if not all(db.execute("SELECT 1 FROM sqlite_schema WHERE name='_sqlx_migrations'").fetchone()
+                       for db in (src, ref)):
+                continue
+            old, local = (db.execute(migrations).fetchall() for db in (src, ref))
+            if old == local or not old:
+                continue
+            if ([r[:3] for r in old] != [r[:3] for r in local] or not all(r[2] == 1 for r in old)
+                    or src.execute(schema).fetchall() != ref.execute(schema).fetchall()):
+                continue
+            with src:
+                src.executemany("UPDATE _sqlx_migrations SET checksum=? WHERE version=?",
+                                [(r[3], r[0]) for r in local])
+
+
 def select_client(args, info, config):
     binary = getattr(args, "app_server", None) or info.get("app_server")
     if not binary:
@@ -80,10 +114,16 @@ def read_probe(model, binary, scratch, *, resume=False, size=32, workspaces=None
     session_copy(model.home, home)
     relocate(model, home, home)
     # Keep the probe offline, without copying auth, project trust, plugins or MCP configuration.
+    with connect(home / DATABASES[0]) as db:
+        providers = {row[0] for row in db.execute("SELECT DISTINCT model_provider FROM threads")}
+    builtin = {"openai", "ollama", "lmstudio", "migration_offline"}
+    offline_providers = "".join(
+        f'\n[model_providers.{json.dumps(provider)}]\nname = "Offline history"\nbase_url = "http://127.0.0.1:9/v1"\n'
+        for provider in sorted(p for p in providers if p and p not in builtin))
     (home / "config.toml").write_text(
         'model_provider = "migration_offline"\n'
         '[model_providers.migration_offline]\nname = "Offline history"\n'
-        'base_url = "http://127.0.0.1:9/v1"\n', encoding="utf-8")
+        'base_url = "http://127.0.0.1:9/v1"\n' + offline_providers, encoding="utf-8")
     with app_server(binary, home, scratch) as call:
         result = history(call, model.threads, size, resume=resume, workspaces=workspaces)
         if resume:
@@ -91,7 +131,7 @@ def read_probe(model, binary, scratch, *, resume=False, size=32, workspaces=None
     if resume:
         with app_server(binary, home, scratch) as call:
             compare_history(result, history(call, model.threads, size, resume=True, workspaces=workspaces))
-    shutil.rmtree(scratch)
+    remove_scratch(scratch)
     return result
 
 
@@ -126,11 +166,64 @@ def accept(source, target, binary, work, workspaces, overrides, *, size=32):
 
 def swap_candidate(candidate, test, work):
     previous = work / "previous"
-    test.rename(previous)
+    if previous.is_dir() and not any(previous.iterdir()):
+        previous.rmdir()
+    def rename(source, dest):
+        for attempt in range(6):
+            try:
+                source.rename(dest)
+                return
+            except PermissionError:
+                if os.name != "nt" or attempt == 5:
+                    raise
+                time.sleep(0.25 * (attempt + 1))
     try:
-        candidate.rename(test)
+        rename(test, previous)
+    except PermissionError:
+        if os.name != "nt" or previous.exists():
+            raise
+        # Explorer or a watcher can hold the home itself. Only session data was repaired.
+        # Under the caller's lock, save the receipt first and publish its replacement last.
+        logs = set()
+        for parent in (test, candidate):
+            for folder in LOG_DIRECTORIES:
+                for p in (parent / folder).rglob("*"):
+                    if p.resolve() != p:
+                        raise ValueError(f"Redirected session path: {p}")
+                    if p.is_file():
+                        logs.add(p.relative_to(parent))
+        entries = [*sorted(logs), *SESSION_FILES]
+        for parent in (test, candidate):
+            if parent.resolve() != parent or any((parent / p).resolve() != parent / p for p in [*entries, RECEIPT]):
+                raise ValueError(f"Redirected session path under {parent}")
+            if any(Path(str(parent / db) + suffix).exists() for db in DATABASES
+                   for suffix in ("-wal", "-shm", "-journal")):
+                raise ValueError(f"SQLite sidecar still present under {parent}; close the test client")
+        previous.mkdir()
+        saved, installed = [], []
+        try:
+            for rel in [RECEIPT, *entries]:
+                old = test / rel
+                if old.exists():
+                    (previous / rel).parent.mkdir(parents=True, exist_ok=True)
+                    rename(old, previous / rel)
+                    saved.append(rel)
+            for rel in [*entries, RECEIPT]:
+                if (candidate / rel).exists():
+                    (test / rel).parent.mkdir(parents=True, exist_ok=True)
+                    rename(candidate / rel, test / rel)
+                    installed.append(rel)
+        except BaseException:
+            for rel in reversed(installed):
+                rename(test / rel, candidate / rel)
+            for rel in reversed(saved):
+                rename(previous / rel, test / rel)
+            raise
+        return
+    try:
+        rename(candidate, test)
     except BaseException:
-        previous.rename(test)
+        rename(previous, test)
         raise
 
 
@@ -143,11 +236,14 @@ def repair(args, config, extract):
         work = Path(mkdtemp(prefix=".session-repair-", dir=config.test.parent))
         try:
             extracted = extract(repo, info["commit"], info["snapshot"], work)
+            if not args.plan:
+                match_local_migrations(extracted, config.formal)
             source = Snapshot(extracted)
             if args.plan:
                 print(json.dumps({"commit": info["commit"], "snapshot": info["snapshot"],
                                   "workspaces": source.plan()}, indent=2, ensure_ascii=False))
             else:
+                recover_interrupted_tail(source)
                 supplied = json.loads(args.map.read_text(encoding="utf-8-sig")) if args.map else {}
                 maps = Workspaces(source, supplied, config.test.parent / ".codex-history-view")
                 binary, version = select_client(args, info, config)
@@ -194,7 +290,7 @@ def repair(args, config, extract):
         except BaseException:
             print(f"Prepared test home retained at {config.test}. Repair staging retained at {work}")
             raise
-        shutil.rmtree(work)
+        remove_scratch(work)
 
 
 def verify(config, args, extract):
@@ -205,6 +301,9 @@ def verify(config, args, extract):
         binary, version = select_client(args, info, config)
         with TemporaryDirectory(prefix=".history-check-", dir=config.test.parent) as temp:
             work = Path(temp)
-            source = Snapshot(extract(repo, info["commit"], info["snapshot"], work))
+            extracted = extract(repo, info["commit"], info["snapshot"], work)
+            match_local_migrations(extracted, config.formal)
+            source = Snapshot(extracted)
+            recover_interrupted_tail(source)
             turns = accept(source, config.test, binary, work, info["workspaces"], set(info["overrides"]))
         print(f"Verified {len(source.threads)} threads and {turns} visible turns with {version}")

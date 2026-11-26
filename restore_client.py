@@ -121,14 +121,19 @@ def history(call, threads, size=32, *, resume=False, workspaces=None):
     catalog = {}
     for archived in (False, True):
         parents = sorted({t.attached_to for t in threads.values() if t.attached_to})
-        for scope in [{}, *({"attachedToThreadId": pid} for pid in parents)]:
+        spawns = sorted({t.spawn_parent for t in threads.values() if t.spawn_parent})
+        for scope in [{}, *({"attachedToThreadId": pid} for pid in parents),
+                      *({"parentThreadId": pid} for pid in spawns)]:
+            seen = set()
             for t in pages(call, "thread/list", {"archived": archived, "modelProviders": [],
                                                  "sourceKinds": SOURCES, "useStateDbOnly": True,
                                                  "currentAccountOnly": False, **scope}, size):
                 tid = t["id"]
-                if tid in catalog:
-                    raise ValueError(f"{tid}: duplicate catalog entry")
-                catalog[tid] = (t["name"] or t["preview"], archived)
+                entry = (t["name"] or t["preview"], archived)
+                if tid in seen or (tid in catalog and catalog[tid] != entry):
+                    raise ValueError(f"{tid}: duplicate or inconsistent catalog entry")
+                seen.add(tid)
+                catalog[tid] = entry
     if set(catalog) != set(threads):
         raise ValueError(f"Client catalog ID mismatch: {sorted(set(catalog) ^ set(threads))}")
     result = {}
@@ -164,14 +169,20 @@ def history(call, threads, size=32, *, resume=False, workspaces=None):
             logged = threads[tid].recorded_turns()
             if logged and logged != list(turns):
                 raise ValueError(f"log chain has {len(logged)} turns, client returned {len(turns)} in a different history")
-            if resume and not archived:
+            # The desktop opens spawned agents through their parent; standalone resume can
+            # inherit the parent's roots or be refused. Their complete pages are checked above.
+            if resume and not archived and not threads[tid].spawn_parent:
                 opened = call("thread/resume", {"threadId": tid, "excludeTurns": True})
                 if opened["thread"]["id"] != tid:
                     raise ValueError("resume opened a different thread")
                 if workspaces is not None:
                     expected = workspaces[tid]
-                    if (not same_directories([opened["cwd"]], [expected["cwd"]]) or expected["roots"] is not None
-                            and not same_directories(opened["runtimeWorkspaceRoots"], expected["roots"])):
+                    roots = expected["roots"]
+                    # A client can expose its current directory as the implicit root for an empty workspace list.
+                    if roots == [] and opened["runtimeWorkspaceRoots"]:
+                        roots = [expected["cwd"]]
+                    if (not same_directories([opened["cwd"]], [expected["cwd"]]) or roots is not None
+                            and not same_directories(opened["runtimeWorkspaceRoots"], roots)):
                         raise ValueError(f"resumed workspace differs: cwd={opened['cwd']!r}, "
                                          f"roots={opened['runtimeWorkspaceRoots']!r}")
                 call("thread/unsubscribe", {"threadId": tid})
