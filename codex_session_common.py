@@ -202,7 +202,16 @@ def rollout_relative(value, home):
     if not isinstance(value, str) or not value:
         return None
     path = Path(value)
-    if not path.is_absolute() or not path.is_relative_to(home) or ".." in path.parts:
+    if not path.is_absolute() or ".." in path.parts:
+        return None
+    prefix = "\\\\?\\"
+    if os.name == "nt" and path.drive.startswith(prefix) and not home.drive.startswith(prefix):
+        # Codex can store an extended-length spelling of the same Windows path.
+        home_name = str(home)
+        if home_name.startswith("\\\\"):
+            home_name = "UNC\\" + home_name[2:]
+        home = Path(prefix + home_name)
+    if not path.is_relative_to(home):
         return None
     relative = path.relative_to(home)
     if len(relative.parts) < 2 or relative.parts[0] not in LOG_DIRECTORIES:

@@ -145,6 +145,38 @@ class Snapshots(unittest.TestCase):
         self.dest = self.root / "dest"
         session_copy(self.source, self.dest)
 
+    @unittest.skipUnless(os.name == "nt", "extended-length paths are Windows-only")
+    def test_validate_and_rewrite_extended_windows_rollout_paths(self):
+        prefix = "\\\\?\\"
+        rollouts = {
+            LIVE: rollout(LIVE, LAST),
+            ARCHIVE: rollout(ARCHIVE, archived=True, compressed=True),
+        }
+        with database(self.dest / cli.DATABASES[0]) as db:
+            db.executemany(
+                "UPDATE threads SET rollout_path=? WHERE id=?",
+                [(prefix + str(self.dest / relative), tid) for tid, relative in rollouts.items()],
+            )
+            outside = prefix + str(self.source / rollouts[LIVE])
+            db.execute("UPDATE threads SET rollout_path=? WHERE id=?", (outside, LIVE))
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaisesRegex(ValueError, "1 rollout paths are missing or outside"):
+                cli.validate_copy(self.dest)
+
+        with database(self.dest / cli.DATABASES[0]) as db:
+            db.execute("UPDATE threads SET rollout_path=? WHERE id=?",
+                       (prefix + str(self.dest / rollouts[LIVE]), LIVE))
+
+        cli.validate_copy(self.dest)
+        self.dest.rename(self.root / "promoted")
+        promoted = self.root / "promoted"
+        cli.rewrite_rollouts(self.dest, promoted)
+        cli.validate_copy(promoted)
+        with database(promoted / cli.DATABASES[0]) as db:
+            self.assertEqual(dict(db.execute("SELECT id, rollout_path FROM threads")),
+                             {tid: str(promoted / relative) for tid, relative in rollouts.items()})
+
     def test_mapping_round_trip_and_indexes(self):
         src = Snapshot(self.source)
         with self.assertRaisesRegex(ValueError, "Confirm mappings"):
