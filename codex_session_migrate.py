@@ -8,7 +8,6 @@ import shutil
 import sqlite3
 import subprocess
 import sys
-import tarfile
 from pathlib import Path, PurePosixPath
 from tempfile import mkdtemp
 
@@ -19,6 +18,7 @@ from codex_session_common import (
     Repository, check_database, connect, directory_lock, is_redirected, load_config, rollout_relative,
 )
 from prepare_codex_copy import stage_copy
+from restore_snapshot import pin, repair, verify
 
 
 def require_formal(config):
@@ -49,44 +49,54 @@ def select_snapshot(repo, name):
 
 
 def extract_snapshot(repo, revision, name, staging):
-    command = ["git", "-C", str(repo.path), "archive", "--format=tar", revision, "--", name]
-    with subprocess.Popen(command, stdout=subprocess.PIPE) as process:
+    # Read committed bytes, including files subject to export-ignore or checkout EOL conversion.
+    git = ["git", "-C", str(repo.path)]
+    tree = subprocess.check_output([*git, "ls-tree", "-rz", "--full-tree", revision, "--", name])
+    with subprocess.Popen([*git, "cat-file", "--batch"], stdin=subprocess.PIPE, stdout=subprocess.PIPE) as process:
         try:
-            with tarfile.open(fileobj=process.stdout, mode="r|") as archive:
-                for member in archive:
-                    relative = PurePosixPath(member.name)
-                    if (not relative.parts or relative.parts[0] != name or ".." in relative.parts
-                            or any("\\" in part or ":" in part for part in relative.parts)):
-                        raise ValueError(f"Invalid snapshot path: {member.name}")
-                    remainder = relative.parts[1:]
-                    if remainder and remainder[0] not in (*LOG_DIRECTORIES, "sqlite", *SESSION_FILES):
-                        continue
-                    if os.name == "nt" and any(
-                        Path(part).is_reserved() or part.endswith((".", " "))
-                        for part in relative.parts
-                    ):
-                        raise ValueError(f"Snapshot path is incompatible with Windows: {member.name}")
-                    path = staging.joinpath(*relative.parts)
-                    in_logs = bool(remainder) and remainder[0] in LOG_DIRECTORIES
-                    if member.isdir() and (not remainder or in_logs or remainder == ("sqlite",)):
-                        path.mkdir(parents=True, exist_ok=True)
-                    elif member.isfile() and (
-                        "/".join(remainder) in SESSION_FILES or (in_logs and len(remainder) > 1)
-                    ):
-                        path.parent.mkdir(parents=True, exist_ok=True)
-                        with archive.extractfile(member) as source, path.open("xb") as target:
-                            shutil.copyfileobj(source, target)
-                    else:
-                        raise ValueError(f"Unexpected file type in snapshot: {member.name}")
+            for entry in tree.split(b"\0"):
+                if not entry:
+                    continue
+                header, raw_path = entry.split(b"\t", 1)
+                mode, kind, oid = header.split()
+                relative = PurePosixPath(raw_path.decode("utf-8"))
+                if (len(relative.parts) < 2 or relative.parts[0] != name or ".." in relative.parts
+                        or any("\\" in part or ":" in part for part in relative.parts)):
+                    raise ValueError(f"Invalid snapshot path: {relative}")
+                remainder = relative.parts[1:]
+                if remainder[0] not in (*LOG_DIRECTORIES, "sqlite", *SESSION_FILES):
+                    continue
+                if os.name == "nt" and any(Path(part).is_reserved() or part.endswith((".", " "))
+                                           for part in relative.parts):
+                    raise ValueError(f"Snapshot path is incompatible with Windows: {relative}")
+                if (mode not in (b"100644", b"100755") or kind != b"blob" or
+                        not ("/".join(remainder) in SESSION_FILES or
+                             (remainder[0] in LOG_DIRECTORIES and len(remainder) > 1))):
+                    raise ValueError(f"Unexpected snapshot entry: {relative}")
+                process.stdin.write(oid + b"\n")
+                process.stdin.flush()
+                reply = process.stdout.readline().split()
+                if len(reply) != 3 or reply[:2] != [oid, b"blob"]:
+                    raise ValueError(f"Missing committed blob for {relative}")
+                left = int(reply[2])
+                path = staging.joinpath(*relative.parts)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("xb") as target:
+                    while left:
+                        chunk = process.stdout.read(min(left, 1024 * 1024))
+                        if not chunk:
+                            raise ValueError(f"Incomplete committed blob for {relative}")
+                        target.write(chunk)
+                        left -= len(chunk)
+                if process.stdout.read(1) != b"\n":
+                    raise ValueError(f"Invalid Git blob boundary for {relative}")
+            process.stdin.close()
+            if process.wait():
+                raise subprocess.CalledProcessError(process.returncode, process.args)
         except BaseException:
             if process.poll() is None:
                 process.kill()
             raise
-        # Consume remaining tar padding before waiting for the writer.
-        while process.stdout.read(65536):
-            pass
-        if process.wait():
-            raise subprocess.CalledProcessError(process.returncode, command)
     return staging / name
 
 
@@ -104,6 +114,7 @@ def prepare(config, version):
         try:
             snapshot = extract_snapshot(repo, revision, name, staging)
             stage_copy(config.formal, snapshot, candidate)
+            pin(repo, revision, name, candidate)
             desktop.require_test_idle()
             if config.test.is_dir():
                 config.test.rename(previous)
@@ -118,7 +129,7 @@ def prepare(config, version):
     skill = PROJECT / ".agents/skills/codex-session-restore/SKILL.md"
     print(f"Prepared test copy: {config.test}")
     print(f"Ask Codex to repair this copy using {skill}")
-    print("Run test from an external terminal after the repair to validate the copy and start Codex.")
+    print("After repair and test --check-only pass, run test from an external terminal to open the copy.")
 
 
 def validate_copy(home):
@@ -260,11 +271,15 @@ def run(args, config):
             backup(config)
         case "prepare":
             prepare(config, args.version)
+        case "repair":
+            repair(args, config, extract_snapshot)
         case "status":
             Desktop(config).status()
         case "test":
             with directory_lock(config.formal), directory_lock(config.test):
                 validate_copy(config.test)
+                Desktop(config).require_test_idle()
+                verify(config, args, extract_snapshot)
                 if not args.check_only:
                     desktop = Desktop(config)
                     command = desktop.command()
@@ -298,8 +313,14 @@ def main(argv=None):
     prepare_parser = commands.add_parser("prepare", parents=[config_option], help="Fetch a snapshot into the test copy.")
     prepare_parser.add_argument("version", nargs="?")
     prepare_parser.add_argument("--replace", action="store_true", help=argparse.SUPPRESS)
-    test = commands.add_parser("test", parents=[config_option], help="Check the test copy and start Codex using it.")
-    test.add_argument("--check-only", action="store_true", help="Validate the files without switching the desktop.")
+    repair_parser = commands.add_parser("repair", parents=[config_option], help="Repair and compare a prepared snapshot.")
+    repair_parser.add_argument("--test-home", type=Path, help="Confirm the configured test directory.")
+    repair_parser.add_argument("--plan", action="store_true", help="List source workspaces and their local availability.")
+    repair_parser.add_argument("--map", type=Path, help="JSON object mapping exact source paths to local paths or null.")
+    repair_parser.add_argument("--app-server", type=Path, help="Codex CLI executable used by the target desktop.")
+    test = commands.add_parser("test", parents=[config_option], help="Verify pinned history and open the test desktop.")
+    test.add_argument("--app-server", type=Path, help="Override the app-server executable recorded during repair.")
+    test.add_argument("--check-only", action="store_true", help="Compare client history without launching the GUI.")
     commands.add_parser("status", parents=[config_option], help="List desktop processes and known data directories.")
     commands.add_parser("restore", parents=[config_option], help="Exit testing and keep the copy.")
     commands.add_parser("promote", parents=[config_option], help="Make the test copy the formal data directory.")
@@ -313,8 +334,7 @@ def main(argv=None):
     os.umask(0o077)
     try:
         run(args, load_config(getattr(args, "config", DEFAULT_CONFIG)))
-    except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.CalledProcessError,
-            tarfile.TarError, EOFError) as error:
+    except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError, EOFError) as error:
         sys.exit(f"ERROR: {error}")
     except KeyboardInterrupt:
         sys.exit("Interrupted.")
