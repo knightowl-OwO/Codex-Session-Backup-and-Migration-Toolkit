@@ -46,7 +46,7 @@ Keep session snapshots in the private repository because they contain chat messa
 
 ### Desktop launch
 
-`[desktop]` tells the toolkit how to start and identify the Codex desktop app. `desktop.command` specifies the **program to run**. The first item is the executable and any remaining items are its arguments. `paths.test_home` specifies the **data to open**. When you run `test`, the toolkit passes that path as `CODEX_HOME` only to the new Codex process and its children. Your terminal keeps its existing environment.
+`[desktop]` tells the toolkit how to start and identify the Codex desktop app. `desktop.command` lists the executable followed by any arguments. The toolkit sets `CODEX_HOME` for the new process and its children. It uses `paths.test_home` for `test` and `paths.formal_home` for `promote`.
 
 On Linux, the default is `chatgpt` on `PATH`. On macOS, the toolkit looks for `Codex.app` in `/Applications` and `~/Applications`.
 
@@ -93,7 +93,7 @@ Run the commands from the project directory in a terminal outside Codex. The exa
 
    Once Codex opens, check a title in the sidebar, page through an ordinary multi-turn chat to its oldest messages, and open an archived chat. Use `status` to inspect the database path when the OS exposes it.
 
-5. **Promote the verified copy.** If testing reveals a problem, quit the test instance and reopen Codex with the active data directory. The test copy stays available for repair. To make the verified copy active, quit Codex, run `promote`, and reopen Codex normally. If the directory move or log-path update fails, `promote` attempts to put the original directory back and retains earlier rollback backups.
+5. **Promote the verified copy.** Run `promote` from a terminal outside Codex after saving any ongoing work. On Windows, the command force-closes the current user's ChatGPT and Codex processes and their children. When the Windows Codex sandbox service is running, approve the administrator prompt using the same Windows account. The command stops the service during the move, restarts it, and launches the desktop with the active data directory. On Linux the command closes Codex before the move. On macOS, quit Codex before running it. Use `promote --no-launch` to leave the desktop closed. If the directory move or log-path update fails, `promote` attempts to restore the original directory.
 
    ~~~bash
    python codex_session_migrate.py promote
@@ -102,6 +102,8 @@ Run the commands from the project directory in a terminal outside Codex. The exa
 ### Local rollback backup
 
 After a successful `promote`, the previous active directory is saved under `backup_root/codex-YYYYMMDD-HHMMSS/codex`. Once the new directory is in place and its log paths are updated, the toolkit permanently deletes older promotion backups in `backup_root` and keeps the one it just made. Git snapshot retention is controlled separately by `repository.keep`.
+
+The test home is moved into the active location, which releases its old path without duplicating its data. Promotion removes the test launch log and keeps the parent directory, including workspace mappings, the history-only viewing directory and any staging data retained after failed repairs.
 
 ### History verification
 

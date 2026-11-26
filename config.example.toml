@@ -16,7 +16,7 @@ keep = 5
 timestamp_utc_offset_minutes = 0
 
 [desktop]
-# Program run by test. The toolkit passes paths.test_home as CODEX_HOME automatically.
+# Program run by test and promote. The toolkit sets CODEX_HOME for the new process.
 # Linux defaults to chatgpt on PATH. macOS looks for Codex.app.
 # On Windows, set command to your installed executable.
 # command = ['C:\Path\To\Codex.exe']

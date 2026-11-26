@@ -7,8 +7,75 @@ import signal
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+
+
+WINDOWS_SANDBOX = "CodexSandboxService.OpenAI.Codex"
+WINDOWS_PROMOTION_NAMES = frozenset({
+    "chatgpt.exe", "codex.exe", "codex-code-mode.exe",
+    "codex-code-mode-host.exe", "codex-computer-use-swift.exe",
+})
+
+
+def windows_admin():
+    import ctypes
+
+    return bool(ctypes.windll.shell32.IsUserAnAdmin())
+
+
+def windows_sandbox():
+    import psutil
+
+    try:
+        service = psutil.win_service_get(WINDOWS_SANDBOX)
+        service.status()
+        return service
+    except psutil.NoSuchProcess:
+        return None
+
+
+@contextmanager
+def suspend_windows_sandbox():
+    service = windows_sandbox() if sys.platform == "win32" else None
+    if service is None or service.status() == "stopped":
+        yield
+        return
+    if not windows_admin():
+        raise ValueError("Stopping the Windows Codex sandbox service requires administrator access.")
+
+    sc = Path(os.environ["SystemRoot"]) / "System32" / "sc.exe"
+
+    def wait(target):
+        deadline = time.monotonic() + 20
+        while service.status() != target:
+            if time.monotonic() >= deadline:
+                raise ValueError(f"Timed out waiting for {WINDOWS_SANDBOX} to reach {target}.")
+            time.sleep(0.2)
+
+    def change(action, target):
+        status = service.status()
+        if status == target:
+            return
+        if status != f"{action}_pending":
+            result = subprocess.run(
+                [str(sc), action, WINDOWS_SANDBOX], capture_output=True, text=True, errors="replace", timeout=20,
+            )
+            if result.returncode and service.status() not in (target, f"{action}_pending"):
+                raise ValueError(f"Could not {action} {WINDOWS_SANDBOX}: {result.stdout.strip()}")
+        wait(target)
+
+    if service.status() == "start_pending":
+        wait("running")
+    try:
+        change("stop", "stopped")
+        print(f"Stopped Windows sandbox service {WINDOWS_SANDBOX}.", flush=True)
+        yield
+    finally:
+        if service.status() == "stop_pending":
+            wait("stopped")
+        change("start", "running")
 
 
 @dataclass(frozen=True)
@@ -139,6 +206,72 @@ class Desktop:
                 time.sleep(0.25)
         raise ValueError("Codex processes are still running. Exit them before retrying.")
 
+    def windows_promotion_targets(self):
+        import psutil
+
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        runtime = Path(local_app_data) / "OpenAI" / "Codex" if local_app_data else None
+        owner = psutil.Process().username().casefold()
+        roots = []
+        for process in psutil.process_iter(["name", "username"]):
+            try:
+                name = (process.info["name"] or "").casefold()
+                if (process.info["username"] or "").casefold() != owner:
+                    continue
+                if name in self.names | WINDOWS_PROMOTION_NAMES:
+                    roots.append(process)
+                elif name == "node_repl.exe" and runtime and Path(process.exe()).is_relative_to(runtime):
+                    roots.append(process)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+        targets = set(roots)
+        for process in roots:
+            try:
+                children = process.children(recursive=True)
+            except psutil.NoSuchProcess:
+                continue
+            for child in children:
+                try:
+                    if child.username().casefold() == owner:
+                        targets.add(child)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+        return targets
+
+    def require_external_windows_promotion(self, targets=None):
+        import psutil
+
+        if targets is None:
+            targets = self.windows_promotion_targets()
+        caller = psutil.Process()
+        if targets.intersection([caller, *caller.parents()]):
+            raise ValueError("Run promote from an external PowerShell window. It closes Codex and its terminals.")
+
+    def stop_for_promotion(self):
+        if sys.platform != "win32":
+            self.stop()
+            return
+
+        import psutil
+
+        for _ in range(3):
+            targets = self.windows_promotion_targets()
+            self.require_external_windows_promotion(targets)
+            if not targets:
+                return
+            for process in targets:
+                try:
+                    process.kill()
+                except psutil.NoSuchProcess:
+                    continue
+                except psutil.AccessDenied as error:
+                    raise ValueError(f"Could not stop Codex process PID {process.pid}.") from error
+            psutil.wait_procs(targets, timeout=4)
+        if targets := self.windows_promotion_targets():
+            pids = ", ".join(str(process.pid) for process in targets)
+            raise ValueError(f"Codex processes are still running (PIDs: {pids}). Exit them before retrying.")
+
     def command(self):
         if self.config.desktop_command:
             executable, *args = self.config.desktop_command
@@ -163,8 +296,11 @@ class Desktop:
         return [executable, *args]
 
     def launch_test(self, command):
-        env = {**os.environ, "CODEX_HOME": str(self.config.test)}
         log = self.config.test.parent / f"{self.config.test.name}-desktop.log"
+        self.launch(command, self.config.test, log)
+
+    def launch(self, command, home, log):
+        env = {**os.environ, "CODEX_HOME": str(home)}
         options = (
             {"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}
             if sys.platform == "win32" else {"start_new_session": True}
@@ -173,7 +309,7 @@ class Desktop:
             process = subprocess.Popen(
                 command, env=env, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, **options,
             )
-        print(f"Started desktop launcher PID {process.pid} with CODEX_HOME={self.config.test}")
+        print(f"Started desktop launcher PID {process.pid} with CODEX_HOME={home}")
         print(f"Launch log: {log}")
 
     def status(self):

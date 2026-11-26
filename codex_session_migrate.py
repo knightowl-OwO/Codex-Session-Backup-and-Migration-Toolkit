@@ -2,23 +2,28 @@
 """Back up, prepare, validate and promote a Codex session snapshot."""
 
 import argparse
+import base64
 import os
 import re
 import shutil
 import sqlite3
 import subprocess
 import sys
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path, PurePosixPath
-from tempfile import mkdtemp
+from tempfile import TemporaryDirectory, mkdtemp
 
 from backup_codex_sessions import backup
-from codex_desktop import Desktop
+from codex_desktop import Desktop, suspend_windows_sandbox, windows_admin, windows_sandbox
 from codex_session_common import (
     DATABASES, DEFAULT_CONFIG, LOG_DIRECTORIES, PROJECT, SESSION_FILES, SNAPSHOT_NAME,
     Repository, check_database, connect, directory_lock, is_redirected, load_config, rollout_relative,
 )
 from prepare_codex_copy import stage_copy
 from restore_snapshot import pin, repair, verify
+
+
+COMMAND_ERRORS = (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError, EOFError)
 
 
 def require_formal(config):
@@ -217,39 +222,107 @@ def prune_promotion_backups(current):
                   file=sys.stderr)
 
 
-def promote(config):
+def promote(config, desktop=None):
     require_formal(config)
     if not (config.test / "config.toml").is_file():
         raise ValueError(f"Missing Codex configuration in {config.test}. Run prepare first.")
+    desktop = desktop or Desktop(config)
     with directory_lock(config.formal), directory_lock(config.test):
         validate_copy(config.test)
         config.backups.mkdir(parents=True, exist_ok=True)
         parents = (config.formal.parent, config.formal, config.test.parent, config.test, config.backups)
         if len({path.stat().st_dev for path in parents}) != 1:
             raise ValueError("Promotion requires formal, test and backup directories on the same filesystem.")
-        Desktop(config).stop()
-        validate_copy(config.test)
-        report_formal_changes(config)
-        backup_dir = config.backups / f"codex-{config.timestamp()}"
-        backup_dir.mkdir()
-        previous = backup_dir / "codex"
-        try:
-            config.formal.rename(previous)
-            config.test.rename(config.formal)
-            rewrite_rollouts(config.test, config.formal)
-        except BaseException:
-            if previous.exists():
-                try:
-                    if config.formal.exists():
-                        config.formal.rename(backup_dir / "promoted-failed-codex")
-                    previous.rename(config.formal)
-                except OSError as error:
-                    raise ValueError(f"Automatic rollback failed. Check the directories under {backup_dir}.") from error
-                print(f"Restored the formal directory. Check {backup_dir} for the failed copy.", file=sys.stderr)
-            raise
+        desktop.stop_for_promotion()
+        with suspend_windows_sandbox():
+            validate_copy(config.test)
+            report_formal_changes(config)
+            for home in (config.formal, config.test, config.backups):
+                if home.resolve() != home or is_redirected(home.lstat()):
+                    raise ValueError(f"Use a physical directory for promotion: {home}")
+            backup_dir = config.backups / f"codex-{config.timestamp()}"
+            backup_dir.mkdir()
+            previous = backup_dir / "codex"
+            try:
+                config.formal.rename(previous)
+                config.test.rename(config.formal)
+                rewrite_rollouts(config.test, config.formal)
+            except BaseException as failure:
+                if previous.exists():
+                    try:
+                        if config.formal.exists():
+                            config.formal.rename(backup_dir / "promoted-failed-codex")
+                        previous.rename(config.formal)
+                    except OSError as error:
+                        raise ValueError(f"Automatic rollback failed. Check the directories under {backup_dir}.") from error
+                    print(f"Restored the formal directory. Check {backup_dir} for the failed copy.", file=sys.stderr)
+                else:
+                    try:
+                        backup_dir.rmdir()
+                    except OSError:
+                        pass
+                if getattr(failure, "winerror", None) == 32:
+                    raise ValueError(f"A Windows process still holds a promotion directory open. Close its file "
+                                     f"handles and retry. Details: {failure}") from failure
+                raise
+            print(f"Promoted {config.test} to {config.formal}")
+            print(f"Previous formal data: {previous}")
         prune_promotion_backups(backup_dir)
-    print(f"Promoted {config.test} to {config.formal}")
-    print(f"Previous formal data: {previous}")
+        test_log = config.test.parent / f"{config.test.name}-desktop.log"
+        try:
+            if test_log.is_file() and test_log.resolve() == test_log and not is_redirected(test_log.lstat()):
+                test_log.unlink()
+        except OSError as error:
+            print(f"WARNING: Could not remove the test desktop log {test_log}: {error}", file=sys.stderr)
+
+
+def elevated_promotion(config_file):
+    import psutil
+
+    # The original terminal starts the GUI with its original user token after the worker exits.
+    powershell = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+    with TemporaryDirectory(prefix="codex-promotion-") as directory:
+        log = Path(directory) / "output.log"
+        arguments = subprocess.list2cmdline([
+            str(Path(__file__).resolve()), "promote", "--config", str(config_file),
+            "--windows-worker", psutil.Process().username(), str(log),
+        ])
+
+        def quoted(value):
+            return "'" + str(value).replace("'", "''") + "'"
+
+        command = (
+            "$ErrorActionPreference = 'Stop'\n"
+            f"$worker = Start-Process -FilePath {quoted(sys.executable)} "
+            f"-ArgumentList {quoted(arguments)} -Verb RunAs -WindowStyle Hidden -Wait -PassThru\n"
+            "exit $worker.ExitCode"
+        )
+        encoded = base64.b64encode(command.encode("utf-16-le")).decode("ascii")
+        print("Approve the Windows prompt to stop the Codex sandbox service and promote the copy.", flush=True)
+        result = subprocess.run([str(powershell), "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded])
+        if log.is_file():
+            print(log.read_text(encoding="utf-8"), end="", flush=True)
+        if result.returncode:
+            raise ValueError("Elevated promotion failed. Approve the prompt using the current Windows account and "
+                             "check any error above.")
+
+
+def promote_and_launch(args, config, config_file):
+    desktop = Desktop(config)
+    if sys.platform == "win32":
+        desktop.require_external_windows_promotion()
+    command = None if args.no_launch else desktop.command()
+    service = windows_sandbox() if sys.platform == "win32" else None
+    if service is not None and service.status() != "stopped" and not windows_admin():
+        elevated_promotion(config_file)
+    else:
+        promote(config, desktop)
+    if command is not None:
+        try:
+            desktop.launch(command, config.formal, config.backups / "promoted-desktop.log")
+        except OSError as error:
+            raise ValueError(f"Promotion succeeded. Open Codex manually for {config.formal}. "
+                             f"Automatic launch failed: {error}") from error
 
 
 def purge_backup(config, requested):
@@ -264,7 +337,7 @@ def purge_backup(config, requested):
         shutil.rmtree(backup_dir)
 
 
-def run(args, config):
+def run(args, config, config_file):
     match args.action:
         case "backup":
             require_formal(config)
@@ -287,7 +360,7 @@ def run(args, config):
                     validate_copy(config.test)
                     desktop.launch_test(command)
         case "promote":
-            promote(config)
+            promote_and_launch(args, config, config_file)
         case "purge-backup":
             purge_backup(config, args.directory)
         case action:
@@ -323,7 +396,10 @@ def main(argv=None):
     test.add_argument("--check-only", action="store_true", help="Compare client history without launching the GUI.")
     commands.add_parser("status", parents=[config_option], help="List desktop processes and known data directories.")
     commands.add_parser("restore", parents=[config_option], help="Exit testing and keep the copy.")
-    commands.add_parser("promote", parents=[config_option], help="Make the test copy the formal data directory.")
+    promotion_parser = commands.add_parser("promote", parents=[config_option],
+                                           help="Make the test copy active and restart Codex.")
+    promotion_parser.add_argument("--no-launch", action="store_true", help="Leave Codex closed after promotion.")
+    promotion_parser.add_argument("--windows-worker", nargs=2, help=argparse.SUPPRESS)
     commands.add_parser("repair-formal", parents=[config_option], help="Fix stale rollout paths in the formal directory.")
     purge = commands.add_parser("purge-backup", parents=[config_option], help="Remove one local promotion backup.")
     purge.add_argument("directory", type=Path)
@@ -333,8 +409,24 @@ def main(argv=None):
         return
     os.umask(0o077)
     try:
-        run(args, load_config(getattr(args, "config", DEFAULT_CONFIG)))
-    except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError, EOFError) as error:
+        config_file = getattr(args, "config", DEFAULT_CONFIG).resolve()
+        if args.action == "promote" and args.windows_worker:
+            if sys.platform != "win32" or not windows_admin():
+                raise ValueError("The Windows promotion worker must run with administrator access.")
+            import psutil
+
+            owner, log = args.windows_worker
+            if psutil.Process().username().casefold() != owner.casefold():
+                raise ValueError("Use the same Windows account to approve the administrator prompt.")
+            with Path(log).open("x", encoding="utf-8") as output, redirect_stdout(output), redirect_stderr(output):
+                try:
+                    promote(load_config(config_file))
+                except (*COMMAND_ERRORS, KeyboardInterrupt) as error:
+                    print(f"ERROR: {error}", file=sys.stderr)
+                    sys.exit(1)
+        else:
+            run(args, load_config(config_file), config_file)
+    except COMMAND_ERRORS as error:
         sys.exit(f"ERROR: {error}")
     except KeyboardInterrupt:
         sys.exit("Interrupted.")

@@ -9,10 +9,13 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path, PureWindowsPath
+from types import SimpleNamespace
 from unittest.mock import patch
 from uuid import UUID
 
 import codex_session_migrate as cli
+import codex_desktop
+from codex_session_common import Config
 from restore_client import app_server, compare_history, digest
 from restore_rollouts import Snapshot, Workspaces, log_bytes, records, relocate, rewrite_logs, update_indexes
 from restore_snapshot import read_probe, session_copy
@@ -177,6 +180,48 @@ class Snapshots(unittest.TestCase):
             self.assertEqual(dict(db.execute("SELECT id, rollout_path FROM threads")),
                              {tid: str(promoted / relative) for tid, relative in rollouts.items()})
 
+    def test_promote_uses_active_home_and_keeps_history_view(self):
+        config = Config(self.source, self.dest, self.root / "backups", self.root / "git", "unused",
+                        "main", 5, 0)
+        (self.dest / "config.toml").touch()
+        test_log = self.root / "dest-desktop.log"
+        test_log.touch()
+        viewing = self.root / ".codex-history-view"
+        viewing.mkdir()
+        with database(self.dest / cli.DATABASES[0]) as db:
+            for tid, relative in ((LIVE, rollout(LIVE, LAST)), (ARCHIVE, rollout(ARCHIVE, archived=True, compressed=True))):
+                db.execute("UPDATE threads SET rollout_path=? WHERE id=?", (str(self.dest / relative), tid))
+
+        events = []
+
+        @contextlib.contextmanager
+        def suspend():
+            events.append("stop service")
+            try:
+                yield
+            finally:
+                events.append("start service")
+
+        def launch(command, home, log):
+            events.append("launch")
+            self.assertEqual(command, ["desktop"])
+            self.assertEqual(home, config.formal)
+            cli.validate_copy(home)
+
+        with patch.object(cli, "suspend_windows_sandbox", suspend), patch.object(cli.Desktop, "command",
+                 return_value=["desktop"]), patch.object(cli.Desktop, "require_external_windows_promotion"), \
+                patch.object(cli, "windows_sandbox", return_value=None), patch.object(
+                    cli.Desktop, "stop_for_promotion", side_effect=lambda: events.append("close desktop")
+                ), patch.object(cli.Desktop, "launch", side_effect=launch):
+            cli.promote_and_launch(SimpleNamespace(no_launch=False), config, self.root / "config.toml")
+
+        self.assertEqual(events, ["close desktop", "stop service", "start service", "launch"])
+        self.assertFalse(self.dest.exists())
+        self.assertFalse(test_log.exists())
+        self.assertTrue(viewing.is_dir())
+        (previous,) = config.backups.glob("codex-*/codex")
+        self.assertTrue((previous / cli.DATABASES[0]).is_file())
+
     def test_mapping_round_trip_and_indexes(self):
         src = Snapshot(self.source)
         with self.assertRaisesRegex(ValueError, "Confirm mappings"):
@@ -277,6 +322,33 @@ class Snapshots(unittest.TestCase):
         expected = [(t, "same item") for t in snap.threads[LIVE].recorded_turns()]
         with self.assertRaisesRegex(ValueError, "expected 3 visible turns, read 1"):
             compare_history({LIVE: ("title", False, expected)}, {LIVE: ("title", False, expected[:1])})
+
+
+@unittest.skipUnless(os.name == "nt", "tests Windows service control")
+class WindowsPromotion(unittest.TestCase):
+    def test_restart_sandbox_service_after_promotion_failure(self):
+        state = "running"
+        calls = []
+
+        def control(command, **options):
+            nonlocal state
+            action = command[1]
+            calls.append(action)
+            self.assertEqual(command[2], codex_desktop.WINDOWS_SANDBOX)
+            state = {"stop": "stopped", "start": "running"}[action]
+            return subprocess.CompletedProcess(command, 0)
+
+        with (
+            patch.object(codex_desktop, "windows_sandbox", return_value=SimpleNamespace(status=lambda: state)),
+            patch.object(codex_desktop, "windows_admin", return_value=True),
+            patch.object(codex_desktop.subprocess, "run", side_effect=control),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "fixture error"):
+                with codex_desktop.suspend_windows_sandbox():
+                    self.assertEqual(state, "stopped")
+                    raise RuntimeError("fixture error")
+        self.assertEqual(state, "running")
+        self.assertEqual(calls, ["stop", "start"])
 
 
 @unittest.skipUnless(SERVER, "set CODEX_TEST_APP_SERVER to the desktop's Codex CLI")
