@@ -148,6 +148,50 @@ class Snapshots(unittest.TestCase):
         self.dest = self.root / "dest"
         session_copy(self.source, self.dest)
 
+    def test_test_stops_windows_desktop_before_verifying(self):
+        events = []
+        desktop = SimpleNamespace(
+            command=lambda: events.append("command") or ["desktop"],
+            stop_for_restart=lambda: events.append("stop"),
+            require_test_idle=lambda: events.append("idle"),
+            launch_test=lambda command: events.append(("launch", command)),
+        )
+        config = SimpleNamespace(formal=self.root / "formal", test_lock=self.root / "lock", test=self.dest)
+        args = SimpleNamespace(action="test", check_only=False)
+        with (
+            patch.object(cli, "directory_lock", side_effect=lambda _: contextlib.nullcontext()),
+            patch.object(cli, "Desktop", return_value=desktop),
+            patch.object(cli, "validate_copy", side_effect=lambda _: events.append("validate")),
+            patch.object(cli, "verify", side_effect=lambda *_: events.append("verify")),
+            patch.object(cli.sys, "platform", "win32"),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            cli.run(args, config, self.root / "config.toml")
+        self.assertEqual(events, [
+            "command", "stop", "validate", "idle", "verify", "stop", "validate", ("launch", ["desktop"]),
+        ])
+
+    def test_check_only_keeps_windows_desktop_open(self):
+        events = []
+        desktop = SimpleNamespace(
+            command=lambda: self.fail("check-only must not resolve a launcher"),
+            stop_for_restart=lambda: events.append("stop"),
+            require_test_idle=lambda: events.append("idle"),
+            launch_test=lambda _: events.append("launch"),
+        )
+        config = SimpleNamespace(formal=self.root / "formal", test_lock=self.root / "lock", test=self.dest)
+        args = SimpleNamespace(action="test", check_only=True)
+        with (
+            patch.object(cli, "directory_lock", side_effect=lambda _: contextlib.nullcontext()),
+            patch.object(cli, "Desktop", return_value=desktop),
+            patch.object(cli, "validate_copy", side_effect=lambda _: events.append("validate")),
+            patch.object(cli, "verify", side_effect=lambda *_: events.append("verify")),
+            patch.object(cli.sys, "platform", "win32"),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            cli.run(args, config, self.root / "config.toml")
+        self.assertEqual(events, ["validate", "idle", "verify"])
+
     @unittest.skipUnless(os.name == "nt", "extended-length paths are Windows-only")
     def test_validate_and_rewrite_extended_windows_rollout_paths(self):
         prefix = "\\\\?\\"

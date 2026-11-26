@@ -246,9 +246,12 @@ class Desktop:
             targets = self.windows_promotion_targets()
         caller = psutil.Process()
         if targets.intersection([caller, *caller.parents()]):
-            raise ValueError("Run promote from an external PowerShell window. It closes Codex and its terminals.")
+            raise ValueError("Run this command from an external PowerShell window. It closes Codex and its terminals.")
 
     def stop_for_promotion(self):
+        self.stop_for_restart()
+
+    def stop_for_restart(self):
         if sys.platform != "win32":
             self.stop()
             return

@@ -85,7 +85,7 @@ Run the commands from the project directory in a terminal outside Codex. The exa
 
    The mapping file is a private UTF-8 JSON object. Keep it outside the test copy if you want to reuse it. For example, `{"/work/example": "D:/projects/example", "/work/retired": null}` maps one project and preserves history-only access to another. A null mapping uses a stable, empty directory beside the formal home (normally `~/.codex-history-view`) and removes that root from the runtime workspace list. Choose persistent project directories outside the test home. To continue in a history-only project later, rerun repair with its real directory. Omit `--map` when the existing paths are usable. With a custom configuration, pass the same `--config` to each command.
 
-4. **Launch the verified test instance.** From an external terminal, run `test`. On Windows and macOS, fully quit Codex before running the command.
+4. **Launch the verified test instance.** Run `test` from an external terminal. On Windows, save any active work first. The command closes the current user's Codex and ChatGPT processes before checking history and closes any instances reopened during verification before launching the copy. On macOS, fully quit Codex first. Use `test --check-only` to verify history while keeping your regular desktop open.
 
    ~~~bash
    python codex_session_migrate.py test

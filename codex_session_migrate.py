@@ -582,13 +582,17 @@ def run(args, config, config_file):
             Desktop(config).status()
         case "test":
             with directory_lock(config.formal), directory_lock(config.test_lock):
+                desktop = Desktop(config)
+                command = None if args.check_only else desktop.command()
+                if command and sys.platform == "win32":
+                    print("Closing Codex and ChatGPT before testing the copy...", flush=True)
+                    desktop.stop_for_restart()
                 validate_copy(config.test)
-                Desktop(config).require_test_idle()
+                desktop.require_test_idle()
+                print("Comparing chat history with the pinned snapshot. This can take a few minutes...", flush=True)
                 verify(config, args, extract_snapshot)
-                if not args.check_only:
-                    desktop = Desktop(config)
-                    command = desktop.command()
-                    desktop.stop()
+                if command:
+                    desktop.stop_for_restart()
                     validate_copy(config.test)
                     desktop.launch_test(command)
         case "promote":
