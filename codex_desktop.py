@@ -165,12 +165,13 @@ class Desktop:
         return list(_desktop_processes(self.names))
 
     def require_test_idle(self):
-        if not self.config.test.exists():
-            return
+        homes = (self.config.test, self.config.test_runtime)
         for process in self.processes():
-            if (process.home and Path(process.home).resolve() == self.config.test
-                    or any(Path(path).resolve().parent == self.config.test for path in process.databases)):
-                raise ValueError("Exit the desktop test instance before replacing the test copy.")
+            process_home = Path(process.home).resolve() if process.home else None
+            database_homes = [Path(path).resolve() for path in process.databases]
+            if any(process_home == home or any(path.is_relative_to(home) for path in database_homes)
+                   for home in homes):
+                raise ValueError("Exit the desktop test instance before replacing its test or runtime copy.")
             if not process.environment_readable and not process.databases:
                 raise ValueError(f"Could not verify the data directory of {process.name} PID {process.pid}. Exit it and retry.")
 
@@ -299,8 +300,8 @@ class Desktop:
         return [executable, *args]
 
     def launch_test(self, command):
-        log = self.config.test.parent / f"{self.config.test.name}-desktop.log"
-        self.launch(command, self.config.test, log)
+        log = self.config.test.parent / f"{self.config.test_runtime.name}-desktop.log"
+        self.launch(command, self.config.test_runtime, log)
 
     def launch(self, command, home, log):
         env = {**os.environ, "CODEX_HOME": str(home)}
@@ -316,6 +317,8 @@ class Desktop:
         print(f"Launch log: {log}")
 
     def status(self):
+        if self.config.test_runtime.exists():
+            print(f"Test runtime path: {self.config.test_runtime}")
         processes = self.processes()
         if not processes:
             print("No matching Codex processes found.")

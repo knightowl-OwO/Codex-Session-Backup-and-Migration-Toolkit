@@ -43,6 +43,10 @@ class Config:
         return self.test == self.test.parent.parent / ".codex_copy" / ".codex"
 
     @property
+    def test_runtime(self):
+        return self.test.with_name(self.test.name + "-runtime")
+
+    @property
     def test_lock(self):
         # Keep the lock outside a removable copy root, including between migrations.
         return self.test.parent if self.dedicated_copy else self.test
@@ -87,7 +91,9 @@ def load_config(file):
     test = path("test_home", formal.parent / ".codex_copy" / ".codex")
     backups = path("backup_root", formal.parent / ".codex-backups")
     checkout = path("checkout", file.parent / "session-backup-checkout")
-    directories = (formal, test, backups, checkout)
+    test_runtime = test.with_name(test.name + "-runtime")
+    history_view = formal.with_name(formal.name + "-history-view")
+    directories = (formal, test, test_runtime, history_view, backups, checkout)
     for index, left in enumerate(directories):
         if left == left.parent or file.is_relative_to(left) or PROJECT.is_relative_to(left):
             raise ValueError(f"Use a dedicated data directory: {left}")

@@ -90,6 +90,16 @@ def match_local_migrations(extracted, formal):
                                 [(r[3], r[0]) for r in local])
 
 
+def validate_workspace_targets(targets, disposable_homes):
+    for target in targets:
+        if target is None:
+            continue
+        resolved = Path(target).resolve()
+        for home in disposable_homes:
+            if resolved.is_relative_to(home):
+                raise ValueError(f"Workspace {target} is inside a disposable test home: {home}")
+
+
 def select_client(args, info, config):
     binary = getattr(args, "app_server", None) or info.get("app_server")
     if not binary:
@@ -248,10 +258,7 @@ def repair(args, config, extract):
                 legacy = config.test.parent / ".codex-history-view"
                 maps = Workspaces(source, supplied, config.history_view,
                                   legacy_view=legacy if legacy != config.history_view else None)
-                for target in maps.targets.values():
-                    if target is not None and Path(target).resolve().is_relative_to(config.test):
-                        raise ValueError(f"Workspace {target} is inside the disposable test home. "
-                                         "Map it to a persistent directory or choose null for history-only viewing.")
+                validate_workspace_targets(maps.targets.values(), (config.test, config.test_runtime))
                 binary, version = select_client(args, info, config)
                 candidate = work / "repaired"
                 inputs = work / "input"

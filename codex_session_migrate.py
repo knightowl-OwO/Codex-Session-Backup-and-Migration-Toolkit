@@ -3,6 +3,7 @@
 
 import argparse
 import base64
+import json
 import os
 import re
 import shutil
@@ -18,7 +19,8 @@ from backup_codex_sessions import backup
 from codex_desktop import Desktop, suspend_windows_sandbox, windows_admin, windows_sandbox
 from codex_session_common import (
     DATABASES, DEFAULT_CONFIG, LOG_DIRECTORIES, PROJECT, SESSION_FILES, SNAPSHOT_NAME,
-    Repository, check_database, connect, directory_lock, is_redirected, load_config, rollout_relative,
+    Repository, backup_database, check_database, connect, directory_lock, is_redirected, load_config,
+    rollout_relative,
 )
 from prepare_codex_copy import stage_copy
 from restore_rollouts import catalog_rows, records, workspace_fields
@@ -26,6 +28,7 @@ from restore_snapshot import RECEIPT, pin, remove_scratch, repair, verify
 
 
 COMMAND_ERRORS = (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError, EOFError)
+TEST_RUNTIME_MARKER = ".session-test-runtime.json"
 
 
 def require_formal(config):
@@ -137,7 +140,7 @@ def prepare(config, version):
     skill = PROJECT / ".agents/skills/codex-session-restore/SKILL.md"
     print(f"Prepared test copy: {config.test}")
     print(f"Ask Codex to repair this copy using {skill}")
-    print("After repair and test --check-only pass, run test from an external terminal to open the copy.")
+    print("After repair and test --check-only pass, run test from an external terminal to open its disposable runtime.")
 
 
 def validate_copy(home):
@@ -182,6 +185,97 @@ def rewrite_rollouts(old, new):
                     db.execute("UPDATE rollout_migration_skipped_rollouts SET rollout_path=? WHERE rollout_path=?",
                                (str(new / relative), path))
     print(f"Verified rollout paths in {new}")
+
+
+def require_owned_test_runtime(config, runtime=None):
+    runtime = runtime or config.test_runtime
+    try:
+        metadata = runtime.lstat()
+    except FileNotFoundError:
+        return False
+    if runtime.resolve() != runtime or is_redirected(metadata) or not runtime.is_dir():
+        raise ValueError(f"Refusing to replace an unrecognized test runtime: {runtime}")
+    marker = runtime / TEST_RUNTIME_MARKER
+    try:
+        if marker.resolve() != marker or not marker.is_file():
+            raise ValueError
+        owner = json.loads(marker.read_text(encoding="utf-8"))
+        if (not isinstance(owner, dict) or owner.get("format") != 1
+                or Path(owner.get("test_home", "")).resolve() != config.test):
+            raise ValueError
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError(f"Refusing to replace an unrecognized test runtime: {runtime}") from error
+    return True
+
+
+def create_test_runtime(config):
+    source, runtime = config.test, config.test_runtime
+    replacing = require_owned_test_runtime(config, runtime)
+    stage = Path(mkdtemp(prefix=config.scratch_prefix("test-runtime"), dir=source.parent))
+    candidate = stage / "home"
+    database_paths = {Path(path) for path in DATABASES}
+    sidecars = {
+        path.with_name(path.name + suffix)
+        for path in database_paths for suffix in ("-wal", "-shm", "-journal")
+    }
+    preserve_stage = False
+
+    def ignore(folder, names):
+        relative = Path(folder).relative_to(source)
+        return [name for name in names if relative / name in (database_paths | sidecars)]
+
+    try:
+        # SQLite backups capture committed WAL pages; rollout paths need the final runtime path.
+        shutil.copytree(source, candidate, symlinks=True, ignore=ignore)
+        for relative in DATABASES:
+            database = source / relative
+            if database.resolve() != database or is_redirected(database.lstat()):
+                raise ValueError(f"Redirected test database: {database}")
+            target = candidate / relative
+            if target.parent.resolve() != target.parent:
+                raise ValueError(f"Redirected runtime database directory: {target.parent}")
+            backup_database(database, target)
+        receipt_path = source / RECEIPT
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8")) if receipt_path.is_file() else {}
+        (candidate / TEST_RUNTIME_MARKER).write_text(json.dumps({
+            "format": 1,
+            "test_home": str(source),
+            "commit": receipt.get("commit"),
+            "snapshot": receipt.get("snapshot"),
+        }) + "\n", encoding="utf-8")
+
+        previous = stage / "previous-runtime"
+        if replacing:
+            rename_for_promotion(runtime, previous)
+        try:
+            rename_for_promotion(candidate, runtime)
+            rewrite_rollouts(source, runtime)
+            validate_copy(runtime)
+        except BaseException as failure:
+            try:
+                if runtime.exists():
+                    remove_scratch(runtime)
+            except OSError as cleanup_error:
+                if previous.exists():
+                    preserve_stage = True
+                    raise ValueError(f"Could not remove the failed runtime. Previous runtime retained at {previous}; "
+                                     f"staging directory: {stage}") from cleanup_error
+                raise failure
+            try:
+                if previous.exists():
+                    rename_for_promotion(previous, runtime)
+            except OSError as restore_error:
+                preserve_stage = True
+                raise ValueError(f"Could not restore the previous test runtime. Recovery copy retained at "
+                                 f"{previous}; staging directory: {stage}") from restore_error
+            raise
+        if previous.exists():
+            remove_scratch(previous)
+        print(f"Created disposable desktop runtime: {runtime}")
+        return runtime
+    finally:
+        if stage.exists() and not preserve_stage:
+            remove_scratch(stage)
 
 
 def report_formal_changes(config):
@@ -279,9 +373,11 @@ def cleanup_after_promotion(config, references):
             print(f"Kept the copy directory because it is a session workspace: {root}")
             return
 
-        scratch = "|".join(re.escape(config.scratch_prefix(op)) for op in ("session-repair", "history-check", "preparing"))
+        scratch = "|".join(re.escape(config.scratch_prefix(op)) for op in (
+            "session-repair", "history-check", "preparing", "test-runtime",
+        ))
         legacy_lock = f"{config.test.name}.codex-migration.lock"
-        test_log = f"{config.test.name}-desktop.log"
+        test_logs = {f"{config.test.name}-desktop.log", f"{config.test_runtime.name}-desktop.log"}
         for entry in root.iterdir():
             if entry.resolve() != entry or is_redirected(entry.lstat()):
                 continue
@@ -295,16 +391,22 @@ def cleanup_after_promotion(config, references):
                     if any((entry / rel).exists() for rel in promotion_session_paths(entry)):
                         raise ValueError(f"The test home still contains session data: {entry}")
                     remove_test_runtime(entry, protected)
+                elif entry == config.test_runtime:
+                    if require_owned_test_runtime(config, entry):
+                        remove_test_runtime(entry, protected)
                 elif entry.is_dir() and re.fullmatch(f"(?:{scratch})[a-z0-9_]{{8}}", entry.name):
                     children = {child.name for child in entry.iterdir()}
                     # A failed prepare can leave the only copy of a previous test home here.
                     if "previous-home" in children:
                         print(f"Kept previous test home in {entry}")
+                    elif "previous-runtime" in children:
+                        print(f"Kept previous desktop runtime in {entry}")
                     elif all(SNAPSHOT_NAME.fullmatch(name) or name in {
                             "home", "input", "repaired", "previous", "baseline", "candidate", "without-override",
+                            "previous-runtime",
                     } for name in children):
                         remove_scratch(entry)
-                elif entry.is_file() and (entry.name == test_log or
+                elif entry.is_file() and (entry.name in test_logs or
                         config.dedicated_copy and entry.name == legacy_lock and entry.stat().st_size == 0):
                     entry.unlink()
                 elif (config.dedicated_copy and entry.is_file()
@@ -594,6 +696,7 @@ def run(args, config, config_file):
                 if command:
                     desktop.stop_for_restart()
                     validate_copy(config.test)
+                    create_test_runtime(config)
                     desktop.launch_test(command)
         case "promote":
             promote_and_launch(args, config, config_file)
