@@ -150,6 +150,103 @@ class Snapshots(unittest.TestCase):
         self.dest = self.root / "dest"
         session_copy(self.source, self.dest)
 
+    def test_prepare_installs_runtime_links_after_publishing_final_home(self):
+        config = SimpleNamespace(
+            formal=self.source, test=self.dest, test_lock=self.root / "lock",
+            scratch_prefix=lambda operation: f".{operation}-",
+        )
+        repo = SimpleNamespace(path=self.root / "repo", fetch=lambda: None)
+        relative = Path("packages/app-server-daemon/current")
+        target = Path("packages/app-server-daemon/releases/v1")
+
+        def stage(_formal, _snapshot, candidate):
+            (candidate / target).mkdir(parents=True)
+            return {relative: target}
+
+        desktop = SimpleNamespace(require_test_idle=lambda: None)
+        with (
+            patch.object(cli, "Repository", return_value=repo),
+            patch.object(cli, "directory_lock", side_effect=lambda _: contextlib.nullcontext()),
+            patch.object(cli, "Desktop", return_value=desktop),
+            patch.object(cli, "select_snapshot", return_value=("revision", "snapshot")),
+            patch.object(cli, "extract_snapshot", return_value=self.root / "snapshot"),
+            patch.object(cli, "stage_copy", side_effect=stage),
+            patch.object(cli, "pin"),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            cli.prepare(config, None)
+
+        self.assertEqual((self.dest / relative).resolve(strict=True), self.dest / target)
+
+    def test_prepare_restores_previous_home_when_runtime_link_install_fails(self):
+        config = SimpleNamespace(
+            formal=self.source, test=self.dest, test_lock=self.root / "lock",
+            scratch_prefix=lambda operation: f".{operation}-",
+        )
+        repo = SimpleNamespace(path=self.root / "repo", fetch=lambda: None)
+        original = self.dest.stat().st_ino
+
+        def stage(_formal, _snapshot, candidate):
+            candidate.mkdir()
+            (candidate / "new-copy").touch()
+            return {}
+
+        desktop = SimpleNamespace(require_test_idle=lambda: None)
+        with (
+            patch.object(cli, "Repository", return_value=repo),
+            patch.object(cli, "directory_lock", side_effect=lambda _: contextlib.nullcontext()),
+            patch.object(cli, "Desktop", return_value=desktop),
+            patch.object(cli, "select_snapshot", return_value=("revision", "snapshot")),
+            patch.object(cli, "extract_snapshot", return_value=self.root / "snapshot"),
+            patch.object(cli, "stage_copy", side_effect=stage),
+            patch.object(cli, "pin"),
+            patch.object(cli, "install_runtime_links", side_effect=ValueError("link failure")),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            with self.assertRaisesRegex(ValueError, "link failure"):
+                cli.prepare(config, None)
+
+        self.assertEqual(self.dest.stat().st_ino, original)
+        self.assertFalse((self.dest / "new-copy").exists())
+        self.assertEqual(list(self.root.glob(".preparing-*")), [])
+
+    def test_prepare_restores_previous_home_when_publication_fails(self):
+        config = SimpleNamespace(
+            formal=self.source, test=self.dest, test_lock=self.root / "lock",
+            scratch_prefix=lambda operation: f".{operation}-",
+        )
+        repo = SimpleNamespace(path=self.root / "repo", fetch=lambda: None)
+        original = self.dest.stat().st_ino
+
+        def stage(_formal, _snapshot, candidate):
+            candidate.mkdir()
+            return {}
+
+        original_rename = Path.rename
+
+        def rename(path, target):
+            if path.name == "home" and target == self.dest:
+                raise OSError("publication failure")
+            return original_rename(path, target)
+
+        desktop = SimpleNamespace(require_test_idle=lambda: None)
+        with (
+            patch.object(cli, "Repository", return_value=repo),
+            patch.object(cli, "directory_lock", side_effect=lambda _: contextlib.nullcontext()),
+            patch.object(cli, "Desktop", return_value=desktop),
+            patch.object(cli, "select_snapshot", return_value=("revision", "snapshot")),
+            patch.object(cli, "extract_snapshot", return_value=self.root / "snapshot"),
+            patch.object(cli, "stage_copy", side_effect=stage),
+            patch.object(cli, "pin"),
+            patch.object(Path, "rename", rename),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            with self.assertRaisesRegex(OSError, "publication failure"):
+                cli.prepare(config, None)
+
+        self.assertEqual(self.dest.stat().st_ino, original)
+        self.assertEqual(list(self.root.glob(".preparing-*")), [])
+
     def test_test_stops_windows_desktop_before_verifying(self):
         events = []
         marker = {"threads": [], "launched": False}

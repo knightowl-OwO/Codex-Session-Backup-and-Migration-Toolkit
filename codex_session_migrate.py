@@ -124,22 +124,37 @@ def prepare(config, version):
         config.test.parent.mkdir(parents=True, exist_ok=True)
         staging = Path(mkdtemp(prefix=config.scratch_prefix("preparing"), dir=config.test.parent))
         candidate, previous = staging / "home", staging / "previous-home"
+        published = False
+        preserve_staging = False
         try:
             snapshot = extract_snapshot(repo, revision, name, staging)
-            stage_copy(config.formal, snapshot, candidate)
+            runtime_links = stage_copy(config.formal, snapshot, candidate)
             (candidate / TEST_MARKER).unlink(missing_ok=True)
             pin(repo, revision, name, candidate)
             desktop.require_test_idle()
             if config.test.is_dir():
                 config.test.rename(previous)
             candidate.rename(config.test)
-        finally:
-            if previous.exists() and candidate.exists():
-                try:
+            published = True
+            install_runtime_links(config.test, runtime_links)
+        except BaseException:
+            try:
+                if published:
+                    config.test.rename(candidate)
+                    published = False
+                if previous.exists():
                     previous.rename(config.test)
-                except OSError as error:
-                    raise ValueError(f"Previous test copy is available at {previous}") from error
-            shutil.rmtree(staging)
+            except OSError as error:
+                preserve_staging = True
+                raise ValueError(
+                    f"Could not restore the previous test copy. Check {config.test} and {staging}."
+                ) from error
+            raise
+        finally:
+            if preserve_staging:
+                print(f"Preserved prepare recovery data: {staging}", file=sys.stderr)
+            else:
+                shutil.rmtree(staging)
     skill = PROJECT / ".agents/skills/codex-session-restore/SKILL.md"
     print(f"Prepared test copy: {config.test}")
     print(f"Ask Codex to repair this copy using {skill}")

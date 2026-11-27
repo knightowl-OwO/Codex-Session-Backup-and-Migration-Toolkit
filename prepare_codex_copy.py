@@ -116,7 +116,6 @@ def stage_copy(formal, snapshot, target):
 
     # SQLite's backup API includes committed WAL pages in the copied local databases.
     shutil.copytree(formal, target, symlinks=True, ignore=ignore)
-    install_runtime_links(target, runtime_links)
     for name in sorted(local_databases):
         backup_database(formal / name, target / name)
 
@@ -136,3 +135,4 @@ def stage_copy(formal, snapshot, target):
             raise ValueError(f"Redirected snapshot destination: {destination.parent}")
         destination.parent.mkdir(parents=True, exist_ok=True)
         source.rename(destination)
+    return runtime_links
