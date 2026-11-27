@@ -1,0 +1,18 @@
+# Machine-local configuration and private snapshot checkout
+/config.toml
+/session-backup-checkout/
+
+# Python-generated files and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
