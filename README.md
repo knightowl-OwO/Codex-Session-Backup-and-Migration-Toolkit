@@ -83,7 +83,7 @@ Run commands from the toolkit root. Codex can perform the restore work through `
    python codex_session_migrate.py prepare
    ~~~
 
-3. **Give Codex the repair skill and the test path printed by `prepare`.** The skill runs the commands below. The plan lists source directories, affected threads and fields, and whether each directory already exists locally. Confirm the missing project's local directory or choose history-only viewing. [Session repair skill](.agents/skills/codex-session-restore/SKILL.md)
+3. **Give Codex the repair skill and the test path printed by `prepare`.** Codex will inspect the source workspaces, ask about any genuinely ambiguous paths, repair the session layer, and complete the non-launching acceptance check. [Session repair skill](.agents/skills/codex-session-restore/SKILL.md)
 
    Replace the two placeholders and paste this prompt into Codex with the skill attached or accessible at the stated path:
 
@@ -97,13 +97,7 @@ Run commands from the toolkit root. Codex can perform the restore work through `
    After check-only succeeds, report the pinned commit, snapshot, client version, verified thread and visible-turn counts, history-only workspaces, whether repair staging was removed, and the exact external-terminal command for the full test.
    ~~~
 
-   ~~~bash
-   python codex_session_migrate.py repair --plan --test-home "<prepared path>" --write-map-draft "<private mapping file>"
-   python codex_session_migrate.py repair --test-home "<prepared path>" --map "<mapping file>"
-   python codex_session_migrate.py test --check-only
-   ~~~
-
-   The plan writes a private UTF-8 JSON draft and reports the paths that still need a decision. Keep it outside the toolkit checkout, formal home, and prepared home so it can be reused after the copy is deleted. For example, `{"/work/example": "D:/projects/example", "/work/retired": null}` maps one project and preserves history-only access to another. In a new draft, unresolved paths are temporarily written as `null`; they become history-only only after the user explicitly approves that choice. A confirmed null mapping uses the stable, empty directory beside the formal home (normally `~/.codex-history-view`). Accept an automatic replacement only when the destination is an existing, unique project directory; decide the remaining ambiguous projects once, or mark them history-only. To continue in a history-only project later, rerun repair with its real directory. Pass the draft with `--map` whenever it contains reused cross-platform mappings or confirmed null values, even if the plan reports `unresolved: []`; omit it only when every source path is already usable as written. Use `repair --keep-staging` only when deliberately debugging a failed candidate. With a custom configuration, pass the same `--config` to each command.
+   During this work, Codex creates or reuses a private UTF-8 workspace map outside the toolkit checkout, formal home, and prepared home. Existing local directories can be reused directly; missing paths require either an existing destination project directory or explicit approval for history-only access. A newly generated `null` value is only a placeholder until that choice is confirmed. The skill contains the underlying repair and acceptance commands, so the user does not need to run them separately.
 
 4. **Launch the verified test instance.** Run `test` from an external terminal. On Windows, save active work first; the command closes the current user's Codex and ChatGPT processes before final validation and launch. On macOS and Linux, fully quit an existing test instance before rerunning. After the workflow above, `test` validates and reuses the unlaunched acceptance marker written by `test --check-only`, so it normally does not repeat the expensive full-history comparison. The GUI opens `test_home` itself, so new chats, settings, caches, and normal SQLite/log updates become part of the exact copy eligible for promotion.
 
