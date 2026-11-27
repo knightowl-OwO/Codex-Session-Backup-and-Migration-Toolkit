@@ -15,11 +15,18 @@ from codex_desktop import Desktop
 from codex_session_common import (
     DATABASES, LOG_DIRECTORIES, SESSION_FILES, SNAPSHOT_NAME, Repository, backup_database, connect, directory_lock,
 )
-from prepare_codex_copy import stage_copy
 from restore_client import app_server, compare_history, history
-from restore_rollouts import Snapshot, Workspaces, recover_interrupted_tail, relocate, rewrite_logs, update_indexes
+from restore_rollouts import (
+    Snapshot, Workspaces, local_directory, recover_interrupted_tail, relocate, rewrite_logs, update_indexes,
+)
 
 RECEIPT = ".session-restore.json"
+TEST_MARKER = ".session-test.json"
+SESSION_LAYER = (*LOG_DIRECTORIES, *SESSION_FILES)
+
+
+class RepairRollbackError(RuntimeError):
+    """The session-layer install failed and its automatic rollback was incomplete."""
 
 
 def remove_scratch(path):
@@ -59,8 +66,12 @@ def session_copy(home, target):
     target.mkdir()
     for directory in LOG_DIRECTORIES:
         source = home / directory
-        if source.exists():
+        if source.is_dir():
             shutil.copytree(source, target / directory, symlinks=True)
+        elif source.exists():
+            raise ValueError(f"Expected a session directory: {source}")
+        else:
+            (target / directory).mkdir()
     for path in SESSION_FILES:
         if path in DATABASES:
             backup_database(home / path, target / path)
@@ -98,6 +109,33 @@ def validate_workspace_targets(targets, disposable_homes):
         for home in disposable_homes:
             if resolved.is_relative_to(home):
                 raise ValueError(f"Workspace {target} is inside a disposable test home: {home}")
+
+
+def write_map_draft(path, plan):
+    """Write an exact-path mapping draft while preserving still-valid prior decisions."""
+    path = Path(path).expanduser().resolve()
+    previous = {}
+    if path.exists():
+        previous = json.loads(path.read_text(encoding="utf-8-sig"))
+        if not isinstance(previous, dict):
+            raise ValueError(f"Existing map draft is not a JSON object: {path}")
+    draft, unresolved, history_only = {}, [], []
+    for item in plan:
+        source = item["source"]
+        if item["available"]:
+            target = source
+        elif source in previous and previous[source] is None:
+            target = None
+            history_only.append(source)
+        elif source in previous and isinstance(previous[source], str) and local_directory(previous[source]):
+            target = previous[source]
+        else:
+            target = None
+            unresolved.append(source)
+        draft[source] = target
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(draft, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return path, unresolved, history_only
 
 
 def select_client(args, info, config):
@@ -175,65 +213,84 @@ def accept(source, target, binary, work, workspaces, overrides, *, size=32):
 
 
 def swap_candidate(candidate, test, work):
-    previous = work / "previous"
-    if previous.is_dir() and not any(previous.iterdir()):
-        previous.rmdir()
-    def rename(source, dest):
+    """Install only the repaired session layer, leaving the local runtime profile untouched."""
+    previous = work / "previous-session-layer"
+    manifest = work / "session-install.json"
+    if previous.exists():
+        raise ValueError(f"Unexpected existing session rollback directory: {previous}")
+    if not test.is_dir() or test.resolve() != test or candidate.resolve() != candidate:
+        raise ValueError("Repair requires physical candidate and test-home directories")
+    missing = [relative for relative in LOG_DIRECTORIES if not (candidate / relative).is_dir()]
+    missing.extend(relative for relative in (*SESSION_FILES, RECEIPT) if not (candidate / relative).is_file())
+    if missing:
+        raise ValueError(f"Repaired session candidate is incomplete: {missing}")
+    for parent in (test, candidate):
+        for relative in (*SESSION_LAYER, RECEIPT, TEST_MARKER):
+            entry = parent / relative
+            try:
+                metadata = entry.lstat()
+            except FileNotFoundError:
+                continue
+            if entry.resolve() != entry or stat.S_ISLNK(metadata.st_mode):
+                raise ValueError(f"Redirected session path: {entry}")
+            if stat.S_ISDIR(metadata.st_mode):
+                for child in entry.rglob("*"):
+                    if child.resolve() != child:
+                        raise ValueError(f"Redirected session path: {child}")
+        if any(Path(str(parent / db) + suffix).exists() for db in DATABASES
+               for suffix in ("-wal", "-shm", "-journal")):
+            raise ValueError(f"SQLite sidecar still present under {parent}; close the test client")
+
+    def rename(source, destination):
+        destination.parent.mkdir(parents=True, exist_ok=True)
         for attempt in range(6):
             try:
-                source.rename(dest)
+                source.rename(destination)
                 return
             except PermissionError:
                 if os.name != "nt" or attempt == 5:
                     raise
                 time.sleep(0.25 * (attempt + 1))
+
+    previous.mkdir()
+    saved, installed = [], []
     try:
-        rename(test, previous)
-    except PermissionError:
-        if os.name != "nt" or previous.exists():
-            raise
-        # Explorer or a watcher can hold the home itself. Only session data was repaired.
-        # Under the caller's lock, save the receipt first and publish its replacement last.
-        logs = set()
-        for parent in (test, candidate):
-            for folder in LOG_DIRECTORIES:
-                for p in (parent / folder).rglob("*"):
-                    if p.resolve() != p:
-                        raise ValueError(f"Redirected session path: {p}")
-                    if p.is_file():
-                        logs.add(p.relative_to(parent))
-        entries = [*sorted(logs), *SESSION_FILES]
-        for parent in (test, candidate):
-            if parent.resolve() != parent or any((parent / p).resolve() != parent / p for p in [*entries, RECEIPT]):
-                raise ValueError(f"Redirected session path under {parent}")
-            if any(Path(str(parent / db) + suffix).exists() for db in DATABASES
-                   for suffix in ("-wal", "-shm", "-journal")):
-                raise ValueError(f"SQLite sidecar still present under {parent}; close the test client")
-        previous.mkdir()
-        saved, installed = [], []
-        try:
-            for rel in [RECEIPT, *entries]:
-                old = test / rel
-                if old.exists():
-                    (previous / rel).parent.mkdir(parents=True, exist_ok=True)
-                    rename(old, previous / rel)
-                    saved.append(rel)
-            for rel in [*entries, RECEIPT]:
-                if (candidate / rel).exists():
-                    (test / rel).parent.mkdir(parents=True, exist_ok=True)
-                    rename(candidate / rel, test / rel)
-                    installed.append(rel)
-        except BaseException:
-            for rel in reversed(installed):
-                rename(test / rel, candidate / rel)
-            for rel in reversed(saved):
-                rename(previous / rel, test / rel)
-            raise
-        return
-    try:
-        rename(candidate, test)
-    except BaseException:
-        rename(previous, test)
+        # Remove the old receipt first; publish the new receipt only after all data is in place.
+        for relative in (RECEIPT, TEST_MARKER, *SESSION_LAYER):
+            source = test / relative
+            if source.exists():
+                rename(source, previous / relative)
+                saved.append(relative)
+        for relative in (*SESSION_LAYER, RECEIPT):
+            source = candidate / relative
+            if source.exists():
+                rename(source, test / relative)
+                installed.append(relative)
+    except BaseException as failure:
+        rollback_errors = []
+        for relative in reversed(installed):
+            try:
+                rename(test / relative, candidate / relative)
+            except BaseException as error:
+                rollback_errors.append((relative, repr(error)))
+        for relative in reversed(saved):
+            try:
+                rename(previous / relative, test / relative)
+            except BaseException as error:
+                rollback_errors.append((relative, repr(error)))
+        if rollback_errors:
+            manifest.write_text(json.dumps({
+                "format": 1,
+                "test_home": str(test),
+                "candidate": str(candidate),
+                "rollback": str(previous),
+                "saved": list(saved),
+                "installed": list(installed),
+                "rollback_errors": rollback_errors,
+            }, indent=2) + "\n", encoding="utf-8")
+            raise RepairRollbackError(
+                f"Session install and rollback both failed; recovery data retained at {work}"
+            ) from failure
         raise
 
 
@@ -244,14 +301,20 @@ def repair(args, config, extract):
         Desktop(config).require_test_idle()
         repo, info = provenance(config)
         work = Path(mkdtemp(prefix=config.scratch_prefix("session-repair"), dir=config.test.parent))
+        keep_staging = bool(getattr(args, "keep_staging", False))
         try:
             extracted = extract(repo, info["commit"], info["snapshot"], work)
             if not args.plan:
                 match_local_migrations(extracted, config.formal)
             source = Snapshot(extracted)
             if args.plan:
-                print(json.dumps({"commit": info["commit"], "snapshot": info["snapshot"],
-                                  "workspaces": source.plan()}, indent=2, ensure_ascii=False))
+                plan = source.plan()
+                result = {"commit": info["commit"], "snapshot": info["snapshot"], "workspaces": plan}
+                draft = getattr(args, "write_map_draft", None)
+                if draft:
+                    path, unresolved, history_only = write_map_draft(draft, plan)
+                    result.update(map_draft=str(path), unresolved=unresolved, history_only=history_only)
+                print(json.dumps(result, indent=2, ensure_ascii=False))
             else:
                 recover_interrupted_tail(source)
                 supplied = json.loads(args.map.read_text(encoding="utf-8-sig")) if args.map else {}
@@ -261,9 +324,7 @@ def repair(args, config, extract):
                 validate_workspace_targets(maps.targets.values(), (config.test, config.test_runtime))
                 binary, version = select_client(args, info, config)
                 candidate = work / "repaired"
-                inputs = work / "input"
-                session_copy(extracted, inputs)
-                stage_copy(config.test, inputs, candidate)
+                session_copy(extracted, candidate)
                 expected = {}
                 for tid, thread in source.threads.items():
                     roots = thread.effective_roots()
@@ -300,10 +361,25 @@ def repair(args, config, extract):
                 print(f"Verified {len(source.threads)} threads and {turns} turns with {version} at {info['commit']}")
                 if info["history_only"]:
                     print(f"History available; map these workspaces to continue in the original projects: {info['history_only']}")
-        except BaseException:
-            print(f"Prepared test home retained at {config.test}. Repair staging retained at {work}")
+        except BaseException as error:
+            preserve = keep_staging or isinstance(error, RepairRollbackError)
+            if preserve:
+                print(f"Prepared test home retained at {config.test}. Repair staging retained at {work}")
+            else:
+                try:
+                    remove_scratch(work)
+                except OSError as cleanup_error:
+                    error.add_note(f"Could not remove repair staging {work}: {cleanup_error}")
+                    print(f"Prepared test home retained at {config.test}. Repair staging could not be removed: {work}")
+                else:
+                    print(f"Prepared test home retained at {config.test}. Temporary repair staging removed.")
             raise
-        remove_scratch(work)
+        else:
+            try:
+                remove_scratch(work)
+            except OSError as cleanup_error:
+                print(f"Repair succeeded, but temporary staging could not be removed: {work} ({cleanup_error})",
+                      file=sys.stderr)
 
 
 def verify(config, args, extract):

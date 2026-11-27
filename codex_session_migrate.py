@@ -3,6 +3,7 @@
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import re
@@ -19,16 +20,17 @@ from backup_codex_sessions import backup
 from codex_desktop import Desktop, suspend_windows_sandbox, windows_admin, windows_sandbox
 from codex_session_common import (
     DATABASES, DEFAULT_CONFIG, LOG_DIRECTORIES, PROJECT, SESSION_FILES, SNAPSHOT_NAME,
-    Repository, backup_database, check_database, connect, directory_lock, is_redirected, load_config,
+    Repository, check_database, connect, directory_lock, is_redirected, load_config,
     rollout_relative,
 )
-from prepare_codex_copy import stage_copy
-from restore_rollouts import catalog_rows, records, workspace_fields
+from prepare_codex_copy import capture_runtime_links, install_runtime_links, stage_copy
+from restore_rollouts import Snapshot, catalog_rows, records, workspace_fields
 from restore_snapshot import RECEIPT, pin, remove_scratch, repair, verify
 
 
 COMMAND_ERRORS = (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError, EOFError)
-TEST_RUNTIME_MARKER = ".session-test-runtime.json"
+TEST_MARKER = ".session-test.json"
+LEGACY_RUNTIME_MARKER = ".session-test-runtime.json"
 
 
 def require_formal(config):
@@ -125,6 +127,7 @@ def prepare(config, version):
         try:
             snapshot = extract_snapshot(repo, revision, name, staging)
             stage_copy(config.formal, snapshot, candidate)
+            (candidate / TEST_MARKER).unlink(missing_ok=True)
             pin(repo, revision, name, candidate)
             desktop.require_test_idle()
             if config.test.is_dir():
@@ -140,7 +143,7 @@ def prepare(config, version):
     skill = PROJECT / ".agents/skills/codex-session-restore/SKILL.md"
     print(f"Prepared test copy: {config.test}")
     print(f"Ask Codex to repair this copy using {skill}")
-    print("After repair and test --check-only pass, run test from an external terminal to open its disposable runtime.")
+    print("After repair and test --check-only pass, run test from an external terminal to open this copy directly.")
 
 
 def validate_copy(home):
@@ -187,95 +190,114 @@ def rewrite_rollouts(old, new):
     print(f"Verified rollout paths in {new}")
 
 
-def require_owned_test_runtime(config, runtime=None):
-    runtime = runtime or config.test_runtime
+def stable_digest(value):
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def receipt_for_test(home):
+    path = home / RECEIPT
+    if not path.is_file() or path.resolve() != path:
+        raise ValueError(f"Missing prepared snapshot receipt: {path}")
+    receipt = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(receipt, dict):
+        raise ValueError(f"Invalid prepared snapshot receipt: {path}")
+    return receipt
+
+
+def semantic_fingerprints(home, baseline_threads=None):
+    snapshot = Snapshot(home)
+    current = snapshot.threads
+    threads = sorted(current) if baseline_threads is None else list(baseline_threads)
+    if any(not isinstance(thread, str) for thread in threads) or len(threads) != len(set(threads)):
+        raise ValueError("Invalid thread list in the test marker")
+    missing = sorted(set(threads) - current.keys())
+    if missing:
+        raise ValueError(f"Restored threads are missing after the desktop test: {missing[:10]}")
+
+    metadata, turns, items = [], [], []
+    for thread_id in threads:
+        thread = current[thread_id]
+        metadata.append([thread_id, thread.title, thread.archived])
+        turns.append([thread_id, thread.recorded_turns()])
+        messages = []
+        for (turn_id, item_id), digest in thread.visible_records("messages"):
+            messages.append([[turn_id, item_id], digest.hex()])
+        items.append([thread_id, messages])
+    return {
+        "threads": threads,
+        "thread_ids_digest": stable_digest(threads),
+        "title_archive_digest": stable_digest(metadata),
+        "turn_ids_digest": stable_digest(turns),
+        "item_messages_digest": stable_digest(items),
+    }
+
+
+def mapping_digest(receipt):
+    return stable_digest({
+        "workspaces": receipt.get("workspaces"),
+        "overrides": receipt.get("overrides"),
+        "history_only": receipt.get("history_only"),
+    })
+
+
+def write_test_marker(config):
+    receipt = receipt_for_test(config.test)
+    marker = {
+        "format": 1,
+        "test_home": str(config.test),
+        "commit": receipt.get("commit"),
+        "snapshot": receipt.get("snapshot"),
+        "client_version": receipt.get("client_version"),
+        "mapping_digest": mapping_digest(receipt),
+        "verified_at": int(time.time()),
+        "launched": False,
+        **semantic_fingerprints(config.test),
+    }
+    path = config.test / TEST_MARKER
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(marker, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+    return marker
+
+
+def validate_test_marker(config):
+    path = config.test / TEST_MARKER
+    if not path.is_file() or path.resolve() != path:
+        raise ValueError("No verified desktop-test marker. Run test --check-only first.")
     try:
-        metadata = runtime.lstat()
-    except FileNotFoundError:
-        return False
-    if runtime.resolve() != runtime or is_redirected(metadata) or not runtime.is_dir():
-        raise ValueError(f"Refusing to replace an unrecognized test runtime: {runtime}")
-    marker = runtime / TEST_RUNTIME_MARKER
-    try:
-        if marker.resolve() != marker or not marker.is_file():
+        marker = json.loads(path.read_text(encoding="utf-8"))
+        receipt = receipt_for_test(config.test)
+        required = {
+            "threads", "thread_ids_digest", "title_archive_digest", "turn_ids_digest", "item_messages_digest",
+        }
+        if (not isinstance(marker, dict) or marker.get("format") != 1 or not required <= marker.keys()
+                or Path(marker.get("test_home", "")).resolve() != config.test
+                or marker.get("commit") != receipt.get("commit")
+                or marker.get("snapshot") != receipt.get("snapshot")
+                or marker.get("client_version") != receipt.get("client_version")
+                or marker.get("mapping_digest") != mapping_digest(receipt)):
             raise ValueError
-        owner = json.loads(marker.read_text(encoding="utf-8"))
-        if (not isinstance(owner, dict) or owner.get("format") != 1
-                or Path(owner.get("test_home", "")).resolve() != config.test):
+        current = semantic_fingerprints(config.test, marker["threads"])
+        if any(marker.get(key) != current[key] for key in required - {"threads"}):
             raise ValueError
     except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
-        raise ValueError(f"Refusing to replace an unrecognized test runtime: {runtime}") from error
-    return True
+        raise ValueError("The verified desktop-test marker no longer matches the restored sessions. "
+                         "Run repair, then test --check-only again.") from error
+    return marker
 
 
-def create_test_runtime(config):
-    source, runtime = config.test, config.test_runtime
-    replacing = require_owned_test_runtime(config, runtime)
-    stage = Path(mkdtemp(prefix=config.scratch_prefix("test-runtime"), dir=source.parent))
-    candidate = stage / "home"
-    database_paths = {Path(path) for path in DATABASES}
-    sidecars = {
-        path.with_name(path.name + suffix)
-        for path in database_paths for suffix in ("-wal", "-shm", "-journal")
-    }
-    preserve_stage = False
-
-    def ignore(folder, names):
-        relative = Path(folder).relative_to(source)
-        return [name for name in names if relative / name in (database_paths | sidecars)]
-
-    try:
-        # SQLite backups capture committed WAL pages; rollout paths need the final runtime path.
-        shutil.copytree(source, candidate, symlinks=True, ignore=ignore)
-        for relative in DATABASES:
-            database = source / relative
-            if database.resolve() != database or is_redirected(database.lstat()):
-                raise ValueError(f"Redirected test database: {database}")
-            target = candidate / relative
-            if target.parent.resolve() != target.parent:
-                raise ValueError(f"Redirected runtime database directory: {target.parent}")
-            backup_database(database, target)
-        receipt_path = source / RECEIPT
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8")) if receipt_path.is_file() else {}
-        (candidate / TEST_RUNTIME_MARKER).write_text(json.dumps({
-            "format": 1,
-            "test_home": str(source),
-            "commit": receipt.get("commit"),
-            "snapshot": receipt.get("snapshot"),
-        }) + "\n", encoding="utf-8")
-
-        previous = stage / "previous-runtime"
-        if replacing:
-            rename_for_promotion(runtime, previous)
-        try:
-            rename_for_promotion(candidate, runtime)
-            rewrite_rollouts(source, runtime)
-            validate_copy(runtime)
-        except BaseException as failure:
-            try:
-                if runtime.exists():
-                    remove_scratch(runtime)
-            except OSError as cleanup_error:
-                if previous.exists():
-                    preserve_stage = True
-                    raise ValueError(f"Could not remove the failed runtime. Previous runtime retained at {previous}; "
-                                     f"staging directory: {stage}") from cleanup_error
-                raise failure
-            try:
-                if previous.exists():
-                    rename_for_promotion(previous, runtime)
-            except OSError as restore_error:
-                preserve_stage = True
-                raise ValueError(f"Could not restore the previous test runtime. Recovery copy retained at "
-                                 f"{previous}; staging directory: {stage}") from restore_error
-            raise
-        if previous.exists():
-            remove_scratch(previous)
-        print(f"Created disposable desktop runtime: {runtime}")
-        return runtime
-    finally:
-        if stage.exists() and not preserve_stage:
-            remove_scratch(stage)
+def mark_test_launched(config, marker, *, reopened=False):
+    marker = dict(marker)
+    marker["launched"] = True
+    marker["last_launched_at"] = int(time.time())
+    marker["launch_count"] = int(marker.get("launch_count", 0)) + 1
+    if reopened:
+        marker["last_launch_was_reopen"] = True
+    path = config.test / TEST_MARKER
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(marker, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
 
 
 def report_formal_changes(config):
@@ -361,6 +383,19 @@ def remove_test_runtime(path, keep):
         remove_scratch(path)
 
 
+def owned_legacy_runtime(config, runtime):
+    """Recognize old disposable runtimes only so promotion can reclaim their storage."""
+    marker = runtime / LEGACY_RUNTIME_MARKER
+    try:
+        metadata = runtime.lstat()
+        owner = json.loads(marker.read_text(encoding="utf-8"))
+        return (runtime.resolve() == runtime and not is_redirected(metadata) and runtime.is_dir()
+                and marker.resolve() == marker and owner.get("format") == 1
+                and Path(owner.get("test_home", "")).resolve() == config.test)
+    except (FileNotFoundError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
 def cleanup_after_promotion(config, references):
     root = config.test.parent
     if not root.exists():
@@ -392,7 +427,7 @@ def cleanup_after_promotion(config, references):
                         raise ValueError(f"The test home still contains session data: {entry}")
                     remove_test_runtime(entry, protected)
                 elif entry == config.test_runtime:
-                    if require_owned_test_runtime(config, entry):
+                    if owned_legacy_runtime(config, entry):
                         remove_test_runtime(entry, protected)
                 elif entry.is_dir() and re.fullmatch(f"(?:{scratch})[a-z0-9_]{{8}}", entry.name):
                     children = {child.name for child in entry.iterdir()}
@@ -542,10 +577,12 @@ def promote(config, desktop=None):
             for home in (config.formal, config.test, config.backups):
                 if home.resolve() != home or is_redirected(home.lstat()):
                     raise ValueError(f"Use a physical directory for promotion: {home}")
+            formal_runtime_links = capture_runtime_links(config.formal)
+            test_runtime_links = capture_runtime_links(config.test)
             try:
                 references = referenced_copy_paths(config.test.parent, config.formal, config.test)
             except (OSError, ValueError, sqlite3.Error) as error:
-                print(f"WARNING: Could not check workspace references. Keeping the test runtime: {error}",
+                print(f"WARNING: Could not check workspace references. Keeping the test-copy directory: {error}",
                       file=sys.stderr)
                 references = None
             backup_dir = config.backups / f"codex-{config.timestamp()}"
@@ -562,6 +599,8 @@ def promote(config, desktop=None):
                         rename_for_promotion(config.formal, previous)
                         formal_moved = True
                         rename_for_promotion(config.test, config.formal)
+                        install_runtime_links(previous, formal_runtime_links)
+                        install_runtime_links(config.formal, test_runtime_links)
                 except OSError as error:
                     if not windows_move_blocked(error):
                         raise
@@ -584,7 +623,8 @@ def promote(config, desktop=None):
                         if config.formal.exists():
                             rename_for_promotion(config.formal, backup_dir / "promoted-failed-codex")
                         rename_for_promotion(previous, config.formal)
-                    except OSError as error:
+                        install_runtime_links(config.formal, formal_runtime_links)
+                    except (OSError, ValueError) as error:
                         raise ValueError(f"Automatic rollback failed. Check the directories under {backup_dir}.") from error
                     print(f"Restored the formal directory: {config.formal}", file=sys.stderr)
                     failed_copy = backup_dir / "promoted-failed-codex"
@@ -602,6 +642,11 @@ def promote(config, desktop=None):
             print(f"Previous formal data: {previous}")
             if session_files_only:
                 print("The backup contains the replaced session files and desktop metadata.")
+            for home in (config.formal, config.test):
+                try:
+                    (home / TEST_MARKER).unlink(missing_ok=True)
+                except OSError as error:
+                    print(f"WARNING: Could not remove the completed test marker from {home}: {error}", file=sys.stderr)
         prune_promotion_backups(backup_dir)
         if references is not None:
             cleanup_after_promotion(config, references)
@@ -679,6 +724,8 @@ def run(args, config, config_file):
         case "prepare":
             prepare(config, args.version)
         case "repair":
+            if getattr(args, "write_map_draft", None) and not args.plan:
+                raise ValueError("--write-map-draft requires --plan")
             repair(args, config, extract_snapshot)
         case "status":
             Desktop(config).status()
@@ -691,12 +738,28 @@ def run(args, config, config_file):
                     desktop.stop_for_restart()
                 validate_copy(config.test)
                 desktop.require_test_idle()
-                print("Comparing chat history with the pinned snapshot. This can take a few minutes...", flush=True)
-                verify(config, args, extract_snapshot)
+                reopening = bool(getattr(args, "reopen", False))
+                if reopening:
+                    marker = validate_test_marker(config)
+                    print(f"Verified {len(marker['threads'])} restored threads after the desktop test.")
+                else:
+                    marker_path = config.test / TEST_MARKER
+                    marker = None
+                    if marker_path.is_file():
+                        marker = validate_test_marker(config)
+                        if marker.get("launched"):
+                            raise ValueError("This copy has already been opened by the desktop. Use test --reopen, "
+                                             "or run repair to restore the pinned state before a new strict test.")
+                        print("Using the current test --check-only validation marker.")
+                    if marker is None:
+                        print("Comparing chat history with the pinned snapshot. This can take a few minutes...", flush=True)
+                        verify(config, args, extract_snapshot)
+                        marker = write_test_marker(config)
                 if command:
                     desktop.stop_for_restart()
                     validate_copy(config.test)
-                    create_test_runtime(config)
+                    marker = validate_test_marker(config)
+                    mark_test_launched(config, marker, reopened=reopening)
                     desktop.launch_test(command)
         case "promote":
             promote_and_launch(args, config, config_file)
@@ -729,10 +792,17 @@ def main(argv=None):
     repair_parser.add_argument("--test-home", type=Path, help="Confirm the configured test directory.")
     repair_parser.add_argument("--plan", action="store_true", help="List source workspaces and their local availability.")
     repair_parser.add_argument("--map", type=Path, help="JSON object mapping exact source paths to local paths or null.")
+    repair_parser.add_argument("--write-map-draft", type=Path,
+                               help="With --plan, write a reusable UTF-8 workspace mapping draft.")
+    repair_parser.add_argument("--keep-staging", action="store_true",
+                               help="Retain failed session-only repair staging for diagnosis.")
     repair_parser.add_argument("--app-server", type=Path, help="Codex CLI executable used by the target desktop.")
     test = commands.add_parser("test", parents=[config_option], help="Verify pinned history and open the test desktop.")
     test.add_argument("--app-server", type=Path, help="Override the app-server executable recorded during repair.")
-    test.add_argument("--check-only", action="store_true", help="Compare client history without launching the GUI.")
+    test_mode = test.add_mutually_exclusive_group()
+    test_mode.add_argument("--check-only", action="store_true", help="Compare client history without launching the GUI.")
+    test_mode.add_argument("--reopen", action="store_true",
+                           help="Reopen a tested copy after checking its restored-thread fingerprints.")
     commands.add_parser("status", parents=[config_option], help="List desktop processes and known data directories.")
     commands.add_parser("restore", parents=[config_option], help="Exit testing and keep the copy.")
     promotion_parser = commands.add_parser("promote", parents=[config_option],

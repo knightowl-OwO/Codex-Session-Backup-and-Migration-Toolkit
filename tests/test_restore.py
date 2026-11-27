@@ -18,7 +18,9 @@ import codex_desktop
 from codex_session_common import Config
 from restore_client import app_server, compare_history, digest
 from restore_rollouts import Snapshot, Workspaces, log_bytes, records, relocate, rewrite_logs, update_indexes
-from restore_snapshot import read_probe, session_copy, validate_workspace_targets
+from restore_snapshot import (
+    RECEIPT, read_probe, session_copy, swap_candidate, validate_workspace_targets, write_map_draft,
+)
 
 SERVER = os.environ.get("CODEX_TEST_APP_SERVER")
 LIVE, ARCHIVE, MIDDLE, LAST = (str(UUID(int=n)) for n in range(101, 105))
@@ -150,6 +152,7 @@ class Snapshots(unittest.TestCase):
 
     def test_test_stops_windows_desktop_before_verifying(self):
         events = []
+        marker = {"threads": [], "launched": False}
         desktop = SimpleNamespace(
             command=lambda: events.append("command") or ["desktop"],
             stop_for_restart=lambda: events.append("stop"),
@@ -159,19 +162,25 @@ class Snapshots(unittest.TestCase):
         config = SimpleNamespace(formal=self.root / "formal", test_lock=self.root / "lock", test=self.dest,
                                  test_runtime=self.dest.with_name(self.dest.name + "-runtime"),
                                  scratch_prefix=lambda operation: f".{operation}-")
-        args = SimpleNamespace(action="test", check_only=False)
+        args = SimpleNamespace(action="test", check_only=False, reopen=False)
         with (
             patch.object(cli, "directory_lock", side_effect=lambda _: contextlib.nullcontext()),
             patch.object(cli, "Desktop", return_value=desktop),
             patch.object(cli, "validate_copy", side_effect=lambda _: events.append("validate")),
             patch.object(cli, "verify", side_effect=lambda *_: events.append("verify")),
-            patch.object(cli, "create_test_runtime", side_effect=lambda _: events.append("runtime")),
+            patch.object(cli, "write_test_marker",
+                         side_effect=lambda _: events.append("write marker") or marker),
+            patch.object(cli, "validate_test_marker",
+                         side_effect=lambda _: events.append("check marker") or marker),
+            patch.object(cli, "mark_test_launched",
+                         side_effect=lambda *_args, **_kwargs: events.append("mark launched")),
             patch.object(cli.sys, "platform", "win32"),
             contextlib.redirect_stdout(io.StringIO()),
         ):
             cli.run(args, config, self.root / "config.toml")
         self.assertEqual(events, [
-            "command", "stop", "validate", "idle", "verify", "stop", "validate", "runtime",
+            "command", "stop", "validate", "idle", "verify", "write marker", "stop", "validate",
+            "check marker", "mark launched",
             ("launch", ["desktop"]),
         ])
 
@@ -184,17 +193,18 @@ class Snapshots(unittest.TestCase):
             launch_test=lambda _: events.append("launch"),
         )
         config = SimpleNamespace(formal=self.root / "formal", test_lock=self.root / "lock", test=self.dest)
-        args = SimpleNamespace(action="test", check_only=True)
+        args = SimpleNamespace(action="test", check_only=True, reopen=False)
         with (
             patch.object(cli, "directory_lock", side_effect=lambda _: contextlib.nullcontext()),
             patch.object(cli, "Desktop", return_value=desktop),
             patch.object(cli, "validate_copy", side_effect=lambda _: events.append("validate")),
             patch.object(cli, "verify", side_effect=lambda *_: events.append("verify")),
+            patch.object(cli, "write_test_marker", side_effect=lambda _: events.append("write marker")),
             patch.object(cli.sys, "platform", "win32"),
             contextlib.redirect_stdout(io.StringIO()),
         ):
             cli.run(args, config, self.root / "config.toml")
-        self.assertEqual(events, ["validate", "idle", "verify"])
+        self.assertEqual(events, ["validate", "idle", "verify", "write marker"])
 
     @unittest.skipUnless(os.name == "nt", "extended-length paths are Windows-only")
     def test_validate_and_rewrite_extended_windows_rollout_paths(self):
@@ -438,7 +448,11 @@ class Snapshots(unittest.TestCase):
     def test_promote_removes_dedicated_copy_and_keeps_stable_history_workspace(self):
         config = self.promotion_fixture()
         copy = config.test.parent
-        runtime = cli.create_test_runtime(config)
+        runtime = config.test_runtime
+        runtime.mkdir()
+        (runtime / cli.LEGACY_RUNTIME_MARKER).write_text(json.dumps({
+            "format": 1, "test_home": str(config.test),
+        }))
         (copy / ".session-repair-abcdefgh" / "repaired").mkdir(parents=True)
         (copy / ".history-check-12345678").mkdir()
         (copy / ".codex-desktop.log").touch()
@@ -457,75 +471,43 @@ class Snapshots(unittest.TestCase):
         self.assertTrue(current.threads[ARCHIVE].archived)
         self.assertEqual(len(list(config.backups.glob("*/codex"))), 1)
 
-    def test_test_runtime_mutations_do_not_change_the_clean_copy(self):
+    def test_reopen_marker_allows_extra_threads_and_detects_baseline_change(self):
         config = Config(self.source, self.dest, self.root / "backups", self.root / "git", "unused",
                         "main", 5, 0)
+        (self.dest / RECEIPT).write_text(json.dumps({
+            "format": 1,
+            "commit": "a" * 40,
+            "snapshot": "codex-git-20260101-000000",
+            "client_version": "codex-cli fixture",
+            "workspaces": {},
+            "overrides": [],
+            "history_only": [],
+        }))
+        marker = cli.write_test_marker(config)
+        # Treat ARCHIVE as a later GUI-created thread by keeping only LIVE in the accepted baseline.
+        marker.update(cli.semantic_fingerprints(self.dest, [LIVE]))
+        (self.dest / cli.TEST_MARKER).write_text(json.dumps(marker))
+        self.assertEqual(cli.validate_test_marker(config)["threads"], [LIVE])
+
         with database(self.dest / cli.DATABASES[0]) as db:
-            for tid, relative in ((LIVE, rollout(LIVE, LAST)),
-                                  (ARCHIVE, rollout(ARCHIVE, archived=True, compressed=True))):
-                db.execute("UPDATE threads SET rollout_path=? WHERE id=?", (str(self.dest / relative), tid))
-        with contextlib.redirect_stdout(io.StringIO()):
-            runtime = cli.create_test_runtime(config)
-        relative = rollout(ARCHIVE, archived=True, compressed=True)
-        runtime_compressed = runtime / relative
-        runtime_plain = runtime_compressed.with_suffix("")
-        runtime_compressed.rename(runtime_plain)
-        with database(runtime / cli.DATABASES[0]) as db:
-            db.execute("UPDATE threads SET rollout_path=? WHERE id=?", (str(runtime_plain), ARCHIVE))
+            db.execute("UPDATE threads SET title='changed during test' WHERE id=?", (LIVE,))
+        with self.assertRaisesRegex(ValueError, "no longer matches"):
+            cli.validate_test_marker(config)
 
-        clean_path = self.dest / relative
-        self.assertTrue(clean_path.is_file())
-        with database(self.dest / cli.DATABASES[0]) as db:
-            clean_rollout = db.execute("SELECT rollout_path FROM threads WHERE id=?", (ARCHIVE,)).fetchone()[0]
-        self.assertEqual(Path(clean_rollout), clean_path)
-
-        events = []
-        desktop = SimpleNamespace(require_test_idle=lambda: events.append("idle"))
-        args = SimpleNamespace(action="test", check_only=True)
-        with (
-            patch.object(cli, "directory_lock", side_effect=lambda _: contextlib.nullcontext()),
-            patch.object(cli, "Desktop", return_value=desktop),
-            patch.object(cli, "verify", side_effect=lambda *_: events.append("verify")),
-            contextlib.redirect_stdout(io.StringIO()),
-        ):
-            cli.run(args, config, self.root / "config.toml")
-        self.assertEqual(events, ["idle", "verify"])
-
-        with contextlib.redirect_stdout(io.StringIO()):
-            fresh_runtime = cli.create_test_runtime(config)
-        self.assertEqual(fresh_runtime, runtime)
-        self.assertTrue((fresh_runtime / relative).is_file())
-        self.assertFalse((fresh_runtime / relative).with_suffix("").exists())
-        with database(fresh_runtime / cli.DATABASES[0]) as db:
-            fresh_path = db.execute("SELECT rollout_path FROM threads WHERE id=?", (ARCHIVE,)).fetchone()[0]
-        self.assertEqual(Path(fresh_path), fresh_runtime / relative)
-        cli.validate_copy(fresh_runtime)
-
-    def test_test_runtime_refuses_to_replace_an_unmarked_directory(self):
-        config = Config(self.source, self.dest, self.root / "backups", self.root / "git", "unused",
-                        "main", 5, 0)
-        runtime = config.test_runtime
-        runtime.mkdir()
-        note = runtime / "keep.txt"
-        note.write_text("user data", encoding="utf-8")
-        with self.assertRaisesRegex(ValueError, "unrecognized test runtime"):
-            cli.create_test_runtime(config)
-        self.assertEqual(note.read_text(encoding="utf-8"), "user data")
-
-    def test_desktop_test_lifecycle_uses_and_protects_runtime(self):
+    def test_desktop_test_lifecycle_uses_and_protects_test_home(self):
         config = Config(self.source, self.dest, self.root / "backups", self.root / "git", "unused",
                         "main", 5, 0)
         desktop = codex_desktop.Desktop(config)
-        process = SimpleNamespace(pid=17, name="Codex.exe", home=str(config.test_runtime),
+        process = SimpleNamespace(pid=17, name="Codex.exe", home=str(config.test),
                                   databases=(), environment_readable=True)
         with patch.object(desktop, "processes", return_value=[process]):
-            with self.assertRaisesRegex(ValueError, "test or runtime copy"):
+            with self.assertRaisesRegex(ValueError, "test copy"):
                 desktop.require_test_idle()
         with patch.object(desktop, "launch") as launch:
             desktop.launch_test(["desktop"])
         launch.assert_called_once_with(
-            ["desktop"], config.test_runtime,
-            config.test.parent / f"{config.test_runtime.name}-desktop.log",
+            ["desktop"], config.test,
+            config.test.parent / f"{config.test.name}-desktop.log",
         )
 
     def test_workspace_mappings_cannot_target_either_disposable_home(self):
@@ -535,6 +517,35 @@ class Snapshots(unittest.TestCase):
             with self.subTest(home=home), self.assertRaisesRegex(ValueError, "disposable test home"):
                 validate_workspace_targets([str(home / "project")], (self.dest, runtime))
         validate_workspace_targets([str(outside)], (self.dest, runtime))
+
+    def test_map_draft_reuses_valid_decisions_and_reports_unresolved_paths(self):
+        available = self.root / "available"
+        mapped = self.root / "mapped"
+        available.mkdir()
+        mapped.mkdir()
+        missing_mapped = "/source/mapped"
+        missing_history = "/source/history-only"
+        missing_new = "/source/needs-decision"
+        draft_path = self.root / "workspace-map.json"
+        draft_path.write_text(json.dumps({missing_mapped: str(mapped), missing_history: None, "stale": None}))
+        plan = [
+            {"source": str(available), "available": True, "uses": []},
+            {"source": missing_mapped, "available": False, "uses": []},
+            {"source": missing_history, "available": False, "uses": []},
+            {"source": missing_new, "available": False, "uses": []},
+        ]
+
+        path, unresolved, history_only = write_map_draft(draft_path, plan)
+
+        self.assertEqual(path, draft_path)
+        self.assertEqual(unresolved, [missing_new])
+        self.assertEqual(history_only, [missing_history])
+        self.assertEqual(json.loads(draft_path.read_text()), {
+            str(available): str(available),
+            missing_mapped: str(mapped),
+            missing_history: None,
+            missing_new: None,
+        })
 
     def test_windows_rename_retries_sharing_violations(self):
         source, destination = self.root / "before", self.root / "after"
@@ -557,28 +568,54 @@ class Snapshots(unittest.TestCase):
         self.assertEqual(attempts, 2)
         self.assertEqual(destination.read_text(encoding="utf-8"), "runtime")
 
-    def test_failed_runtime_swap_retains_previous_copy_if_restore_is_blocked(self):
-        config = Config(self.source, self.dest, self.root / "backups", self.root / "git", "unused",
-                        "main", 5, 0)
-        with database(self.dest / cli.DATABASES[0]) as db:
-            for tid, relative in ((LIVE, rollout(LIVE, LAST)),
-                                  (ARCHIVE, rollout(ARCHIVE, archived=True, compressed=True))):
-                db.execute("UPDATE threads SET rollout_path=? WHERE id=?", (str(self.dest / relative), tid))
-        with contextlib.redirect_stdout(io.StringIO()):
-            runtime = cli.create_test_runtime(config)
-        rename = cli.rename_for_promotion
+    def test_session_swap_preserves_non_session_profile_and_clears_marker(self):
+        candidate = self.root / "candidate"
+        work = self.root / "work"
+        work.mkdir()
+        session_copy(self.source, candidate)
+        (candidate / RECEIPT).write_text('{"version":"new"}')
+        (candidate / "session_index.jsonl").write_text('{"new":true}\n')
+        (self.dest / RECEIPT).write_text('{"version":"old"}')
+        (self.dest / cli.TEST_MARKER).write_text('{"format":1}')
+        runtime = self.dest / "packages" / "app-server" / "binary"
+        runtime.parent.mkdir(parents=True)
+        runtime.write_bytes(b"local runtime")
+        inode = runtime.stat().st_ino
 
-        def block_swap(source, destination):
-            if destination == runtime and source.name in {"home", "previous-runtime"}:
-                raise PermissionError("simulated runtime lock")
-            return rename(source, destination)
+        swap_candidate(candidate, self.dest, work)
 
-        with patch.object(cli, "rename_for_promotion", side_effect=block_swap):
-            with self.assertRaisesRegex(ValueError, "Recovery copy retained") as failure:
-                cli.create_test_runtime(config)
-        recovery = Path(str(failure.exception).split("Recovery copy retained at ", 1)[1].split(";", 1)[0])
-        self.assertTrue((recovery / cli.TEST_RUNTIME_MARKER).is_file())
-        self.assertTrue(recovery.parent.is_dir())
+        self.assertEqual(runtime.read_bytes(), b"local runtime")
+        self.assertEqual(runtime.stat().st_ino, inode)
+        self.assertEqual((self.dest / RECEIPT).read_text(), '{"version":"new"}')
+        self.assertEqual((self.dest / "session_index.jsonl").read_text(), '{"new":true}\n')
+        self.assertFalse((self.dest / cli.TEST_MARKER).exists())
+        self.assertFalse((candidate / "packages").exists())
+
+    def test_failed_session_swap_rolls_back_without_touching_profile(self):
+        candidate = self.root / "candidate"
+        work = self.root / "work"
+        work.mkdir()
+        session_copy(self.source, candidate)
+        (candidate / RECEIPT).write_text('{"version":"new"}')
+        (self.dest / RECEIPT).write_text('{"version":"old"}')
+        (self.dest / cli.TEST_MARKER).write_text('{"format":1}')
+        package = self.dest / "plugins" / "cache" / "entry"
+        package.parent.mkdir(parents=True)
+        package.write_text("local")
+        original_rename = Path.rename
+
+        def fail_install(path, destination):
+            if path == candidate / "session_index.jsonl" and destination == self.dest / "session_index.jsonl":
+                raise OSError("simulated session install failure")
+            return original_rename(path, destination)
+
+        with patch.object(Path, "rename", fail_install):
+            with self.assertRaisesRegex(OSError, "simulated session install failure"):
+                swap_candidate(candidate, self.dest, work)
+
+        self.assertEqual((self.dest / RECEIPT).read_text(), '{"version":"old"}')
+        self.assertTrue((self.dest / cli.TEST_MARKER).is_file())
+        self.assertEqual(package.read_text(), "local")
 
     def test_legacy_workspaces_and_user_files_survive_cleanup(self):
         config = self.promotion_fixture()
